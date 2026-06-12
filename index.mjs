@@ -969,18 +969,21 @@ async function runCreateReference(args) {
 		? await fileToDataUri(resolveIn(projectDir, args.photo_path))
 		: undefined;
 
-	if (args.kind === "product") {
+	if (args.kind === "product" || args.kind === "place") {
 		const out = await engine("create_product", projectDir, {
 			name: args.name,
 			description: args.description,
 			photo,
 			pages_excerpt: excerpt,
+			kind: args.kind,
 		});
 		return [
-			"Product locked ✔",
+			`${args.kind === "place" ? "Place" : "Product"} locked ✔`,
 			`name: ${out.name}`,
 			`look: ${out.description}`,
-			`Cet objet restera IDENTIQUE dans toutes les images qui le citent (param product: "${out.name}", ou automatiquement quand son nom apparaît près d'un placeholder).`,
+			args.kind === "place"
+				? `Ce LIEU sera reconstruit À L'IDENTIQUE dans toutes les images qui le citent (param product: "${out.name}", ou automatiquement quand son nom apparaît près d'un placeholder).`
+				: `Cet objet restera IDENTIQUE dans toutes les images qui le citent (param product: "${out.name}", ou automatiquement quand son nom apparaît près d'un placeholder).`,
 		].join("\n");
 	}
 	const out = await engine("create_character", projectDir, {
@@ -1856,35 +1859,37 @@ const TOOLS = [
 	},
 	{
 		name: "create_reference",
-		title: "Lock a recurring character or product (identical everywhere)",
+		title:
+			"Lock a recurring character, product or place (identical everywhere)",
 		annotations: {
 			readOnlyHint: false,
 			destructiveHint: false,
 			openWorldHint: true,
 		},
 		description:
-			"Lock a RECURRING reference reused identically across every image — kind 'character' (default): the same FACE everywhere, auto-cast or locked from a real photo via photo_path (« c'est lui le professeur » → call this FIRST so every scene reuses that exact face); kind 'product' (e-commerce): the exact same object in every shot. make_images and generate_image use them automatically when their name appears near a slot.",
+			"Lock a RECURRING reference reused identically across every image — kind 'character' (default): the same FACE everywhere, auto-cast or locked from a real photo via photo_path (« c'est lui le professeur » → call this FIRST so every scene reuses that exact face); kind 'product' (e-commerce): the exact same object in every shot; kind 'place': the brand's real location (shop, workshop…) rebuilt identically in every scene (« voilà ma boutique » → photo_path). make_images and generate_image use them automatically when their name appears near a slot.",
 		inputSchema: {
 			type: "object",
 			properties: {
 				kind: {
 					type: "string",
-					enum: ["character", "product"],
-					description: "Default 'character'",
+					enum: ["character", "product", "place"],
+					description:
+						"Default 'character'. 'place' = the brand's real location rebuilt identically",
 				},
 				name: {
 					type: "string",
 					description:
-						"Character role (e.g. 'la pâtissière') or product name as written on the site",
+						"Character role (e.g. 'la pâtissière'), product name as written on the site, or place name (e.g. 'la boulangerie')",
 				},
 				description: {
 					type: "string",
-					description: "product: optional physical description",
+					description: "product/place: optional physical description",
 				},
 				photo_path: {
 					type: "string",
 					description:
-						"Optional absolute path to a real photo to lock (face or product)",
+						"Optional absolute path to a real photo to lock (face, product or place)",
 				},
 				project_dir: {
 					type: "string",
@@ -2077,7 +2082,7 @@ async function handle(msg) {
 				serverInfo: {
 					name: "distribea-mcp",
 					title: "Distribea MCP",
-					version: "1.1.1",
+					version: "1.2.0",
 				},
 				instructions: INSTRUCTIONS,
 			},
