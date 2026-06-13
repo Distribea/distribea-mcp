@@ -229,7 +229,75 @@ const SKIP_DIRS = new Set([
 const PLACEHOLDER_SRC_RE =
 	/placehold\.co|via\.placeholder\.com|placekitten|picsum\.photos|dummyimage\.com|loremflickr\.com|placeimg\.com|fakeimg\.pl|images\.unsplash\.com|source\.unsplash\.com|images\.pexels\.com|cdn\.pixabay\.com|placeholder/i;
 const IMG_TAG_RE = /<(?:img|Image)\b[\s\S]*?>/g;
-const HEADING_RE = /<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/g;
+const HEADING_SCAN_RE = /<h[1-4][^>]*>([\s\S]*?)<\/h[1-4]>/gi;
+const NEXT_HEADING_RE = /<h[1-4][^>]*>/i;
+// Frontières de bloc : on ne relie JAMAIS une image au titre d'une autre section.
+const BLOCK_BOUNDARY_RE =
+	/<\/?(?:section|article|header|footer|main|nav|aside)\b[^>]*>/gi;
+
+// Le « bloc » qui contient l'image : entre la frontière de section juste avant
+// et juste après. Page mal codée (aucune balise de section) → fenêtre bornée
+// pour ne pas aller chercher un titre à l'autre bout du fichier.
+function sectionBoundsForImg(content, imgStart, imgEnd) {
+	let lo = 0;
+	let hi = content.length;
+	for (const b of content.matchAll(BLOCK_BOUNDARY_RE)) {
+		if (b.index < imgStart) {
+			lo = b.index + b[0].length;
+		} else if (b.index >= imgEnd) {
+			hi = b.index;
+			break;
+		}
+	}
+	if (lo === 0 && hi === content.length) {
+		lo = Math.max(0, imgStart - 1200);
+		hi = Math.min(content.length, imgEnd + 1200);
+	}
+	return { lo, hi };
+}
+
+// Titre + description du MÊME bloc que l'image : on prend le titre le plus
+// proche, qu'il soit AU-DESSUS ou EN DESSOUS (cartes image-en-haut/titre-dessous,
+// blocs 2 colonnes…), sans déborder sur la carte voisine. Aucun titre trouvé →
+// on retombe sur le texte juste avant l'image.
+function headingAndContextForImg(content, imgStart, imgEnd) {
+	const { lo, hi } = sectionBoundsForImg(content, imgStart, imgEnd);
+	const scope = content.slice(lo, hi);
+	const relStart = imgStart - lo;
+	const relEnd = imgEnd - lo;
+	let best = null;
+	let bestDist = Number.POSITIVE_INFINITY;
+	for (const h of scope.matchAll(HEADING_SCAN_RE)) {
+		const hStart = h.index;
+		const hEnd = h.index + h[0].length;
+		let dist = 0;
+		if (hEnd <= relStart) {
+			dist = relStart - hEnd;
+		} else if (hStart >= relEnd) {
+			dist = hStart - relEnd;
+		}
+		if (dist < bestDist) {
+			bestDist = dist;
+			best = { text: stripMarkup(h[1]), hEnd };
+		}
+	}
+	if (!best) {
+		return {
+			heading: "",
+			context: stripMarkup(
+				content.slice(Math.max(0, imgStart - 300), imgStart)
+			).slice(-250),
+		};
+	}
+	// Description = le texte qui suit CE titre, borné au titre suivant (pour ne
+	// pas avaler la carte d'après).
+	const afterHead = scope.slice(best.hEnd);
+	const nextHead = afterHead.search(NEXT_HEADING_RE);
+	const desc = stripMarkup(
+		nextHead >= 0 ? afterHead.slice(0, nextHead) : afterHead
+	).slice(0, 280);
+	return { heading: best.text, context: desc };
+}
 
 function walkFiles(dir, out = []) {
 	for (const name of readdirSync(dir)) {
@@ -309,15 +377,18 @@ function scanFileForSlots(file, content) {
 				h = Number(dimM[2]);
 			}
 		}
-		const before = content.slice(Math.max(0, m.index - 700), m.index);
-		const headM = [...before.matchAll(HEADING_RE)].pop();
+		const { heading, context } = headingAndContextForImg(
+			content,
+			m.index,
+			m.index + tag.length
+		);
 		slots.push({
 			file,
 			tag,
 			src: srcM[2],
 			alt: altM?.[2] ?? "",
-			heading: headM ? stripMarkup(headM[1]) : "",
-			context: stripMarkup(before).slice(-250),
+			heading,
+			context,
 			// Le prénom de l'auteur d'un avis est presque toujours SOUS sa photo.
 			after: stripMarkup(
 				content.slice(m.index + tag.length, m.index + tag.length + 500)
@@ -1573,13 +1644,16 @@ function scanRebrandCandidates(projectDir) {
 				continue;
 			}
 			const altM = tag.match(/\balt\s*=\s*\{?\s*(["'])([\s\S]*?)\1/);
-			const before = content.slice(Math.max(0, m.index - 700), m.index);
-			const headM = [...before.matchAll(HEADING_RE)].pop();
+			const { heading } = headingAndContextForImg(
+				content,
+				m.index,
+				m.index + tag.length
+			);
 			const entry = seen.get(resolved) ?? {
 				path: resolved,
 				usedIn: new Set(),
 				alt: altM?.[2] ?? "",
-				heading: headM ? stripMarkup(headM[1]) : "",
+				heading,
 			};
 			entry.usedIn.add(relative(projectDir, file));
 			seen.set(resolved, entry);
