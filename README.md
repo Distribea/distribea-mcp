@@ -58,27 +58,4 @@ A [Distribea](https://distribea.com) subscription is required.
 - Your project files never leave your machine except the specific images you
   ask to edit.
 
-## Privacy Policy
-
-This local connector contains **no API keys and no secrets**. To generate an
-image it sends to the hosted Distribea engine only what is needed for the
-request:
-
-- **What is sent:** your image brief (the subject/prompt you ask for), a short
-  text excerpt of the page being worked on (used to infer the site's style and
-  context), a hashed project identifier, and any image file you explicitly ask
-  to edit. **Your other project files stay on your machine** — they are never
-  read or uploaded.
-- **What is stored, tied to your account:** your locked visual style, recurring
-  characters/products/avatars, the images generated for you (hosted on
-  Distribea's CDN), and your credit/billing usage.
-- **Third parties:** images are produced through Distribea's hosted AI
-  providers solely to fulfil your request. Your data is **never sold**.
-- **Authentication:** calls are authenticated with your personal key
-  (`dmcp_…`), issued and revocable at
-  <https://distribea.com/account/mcp>.
-- **Retention & contact:** data is kept for the life of your account; full
-  policy, retention details and contact at
-  <https://distribea.com/legal/privacy-policy>.
-
 © Distribea, <https://distribea.com>
