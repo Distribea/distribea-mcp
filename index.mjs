@@ -16,7 +16,7 @@
 // ---------------------------------------------------------------------------
 
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import {
@@ -820,6 +820,130 @@ async function runGenerateImage(args, progress) {
 		.join("\n");
 }
 
+// --- blog cover ---------------------------------------------------------------
+const ARTICLE_UA =
+	"Mozilla/5.0 (compatible; DistribeaImages/1.0; +https://distribea.com)";
+
+// Résout le contenu de l'article : fichier local > URL publique > texte collé.
+async function resolveArticle(projectDir, args) {
+	const file = args.article_file ?? args.article_path;
+	if (file) {
+		const p = resolveIn(projectDir, String(file));
+		let raw;
+		try {
+			raw = await readFile(p, "utf8");
+		} catch (e) {
+			throw new Error(`Article introuvable : ${p} (${e.message})`);
+		}
+		return { title: "", text: stripMarkup(raw).slice(0, 8000) };
+	}
+	if (args.article_url) {
+		const u = String(args.article_url).trim();
+		if (!/^https?:\/\//i.test(u)) {
+			throw new Error("article_url doit commencer par http:// ou https://");
+		}
+		let res;
+		try {
+			res = await fetch(u, {
+				headers: { "user-agent": ARTICLE_UA },
+				signal: AbortSignal.timeout(20_000),
+				redirect: "follow",
+			});
+		} catch (e) {
+			throw new Error(`Lecture de l'article impossible (${u}) : ${e.message}`);
+		}
+		if (!res.ok) {
+			throw new Error(
+				`Lecture de l'article impossible (HTTP ${res.status}) — ${u}`
+			);
+		}
+		const html = await res.text();
+		const title = oneLine(
+			html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? ""
+		);
+		const stripped = html
+			.replace(/<script[\s\S]*?<\/script>/gi, " ")
+			.replace(/<style[\s\S]*?<\/style>/gi, " ");
+		return { title, text: stripMarkup(stripped).slice(0, 8000) };
+	}
+	const t = String(args.article_text ?? args.article ?? "").trim();
+	return { title: "", text: t.slice(0, 8000) };
+}
+
+async function runBlogCover(args, progress) {
+	const projectDir = resolveIn(
+		process.cwd(),
+		args.project_dir ?? process.cwd()
+	);
+	const resolved = await resolveArticle(projectDir, args);
+	const title = oneLine(args.title ?? "") || resolved.title || "";
+	const text = resolved.text;
+	if (!(title || text)) {
+		throw new Error(
+			"Donne l'article : article_text (texte collé), article_url (lien public) ou article_file (fichier local)."
+		);
+	}
+	const extra = Math.max(
+		0,
+		Math.min(5, Math.round(Number(args.illustrations ?? 0)))
+	);
+	const count = 1 + extra;
+	// Cover de blog : 16:9 ("wide") par défaut, standard. portrait/square au choix.
+	const orientation = ["wide", "landscape", "portrait", "square"].includes(
+		args.orientation
+	)
+		? args.orientation
+		: "wide";
+	const saveDir = args.save_dir
+		? resolveIn(projectDir, args.save_dir)
+		: join(projectDir, "public", "images");
+
+	progress?.(
+		`🎨 Cover de blog (${count} image${count > 1 ? "s" : ""}, ≈ ${IMAGE_CREDITS_HINT * count} crédits, 30-60 s)…`,
+		0,
+		1
+	);
+
+	const out = await engine("blog_cover", projectDir, {
+		title,
+		text,
+		count,
+		orientation,
+		character: args.character,
+		product: args.product,
+		pages_excerpt: pagesExcerpt(projectDir),
+		client_ref: "blog_cover",
+	});
+
+	const slugBase = slugify(title || text.slice(0, 60) || "article");
+	const images = Array.isArray(out.images) ? out.images : [];
+	const saved = await mapPool(images, 4, async (im, i) => {
+		const fileName =
+			im.role === "cover"
+				? `blog-${slugBase}-cover.webp`
+				: `blog-${slugBase}-${i}.webp`;
+		const outPath = join(saveDir, fileName);
+		await saveUrl(im.cdn_url, outPath);
+		return { ...im, fileName, outPath };
+	});
+
+	const lines = [
+		out.style_inferred ? STYLE_INFERRED_NOTE : "",
+		`Cover de blog générée ✔ (${out.credits} crédits)`,
+	];
+	for (const im of saved) {
+		lines.push(
+			"",
+			im.role === "cover" ? "🖼️ COVER" : "🖼️ illustration",
+			`file: ${im.outPath}`,
+			`size: ${im.width}×${im.height} — ${Math.round(im.bytes / 1024)} KB (WebP)`,
+			`alt: ${im.alt}`,
+			`<img src="/images/${im.fileName}" alt="${String(im.alt).replace(/"/g, "&quot;")}" width="${im.width}" height="${im.height}" loading="${im.role === "cover" ? "eager" : "lazy"}" />`
+		);
+	}
+	return lines.filter(Boolean).join("\n");
+}
+
 const OUT_FORMAT_BY_EXT = {
 	".png": "png",
 	".jpg": "jpeg",
@@ -1499,9 +1623,13 @@ async function runRebrandImages(args, progress) {
 		c.bytes = st.size;
 		candidates.push(c);
 	}
+	const eligibleBeyondCap = Math.max(0, candidates.length - max);
 	candidates.splice(max);
 
 	const notes = [
+		eligibleBeyondCap
+			? `+${eligibleBeyondCap} autre(s) image(s) au-delà de la limite (max_images=${max}) — monte max_images (jusqu'à 20) ou relance pour continuer.`
+			: "",
 		placeholders
 			? `${placeholders} placeholder(s)/stock détecté(s) aussi → make_images (sans rebrand) s'en charge.`
 			: "",
@@ -1673,7 +1801,7 @@ const TOOLS = [
 		title: "Generate one on-brand website image",
 		annotations: {
 			readOnlyHint: false,
-			destructiveHint: false,
+			destructiveHint: true,
 			openWorldHint: true,
 		},
 		description:
@@ -1718,6 +1846,70 @@ const TOOLS = [
 				},
 			},
 			required: ["subject"],
+		},
+	},
+	{
+		name: "blog_cover",
+		title: "Cover image (and optional illustrations) for a blog article",
+		annotations: {
+			readOnlyHint: false,
+			destructiveHint: true,
+			openWorldHint: true,
+		},
+		description:
+			"AUTONOMOUS TRIGGER — call this when an EDITORIAL ARTICLE still LACKS a cover/hero image (a brand-new post, or one left with a placeholder/stock image), even if the user never mentions an image. GUARDRAIL against noise: fire it ONCE per article, only when the cover is missing; if the article already has a real cover, leave it — do NOT regenerate; a pure text/typo/SEO edit is NOT a trigger; never re-run a successful call or 'improve' a cover on your own — only on the user's explicit request (each call bills the subscriber). Recognise the article by MEANING, not by tags: any standalone piece written to be READ — a headline + a body of prose on one topic (blog post, news, guide, tutorial, case study, magazine/journal piece) — in ANY language, on ANY stack (markdown/MDX, a headless CMS like WordPress/Sanity/Contentful, or a custom DB-driven route). Folders/routes (/blog, /posts, /articles, /news, /journal, /actualités, /magazine, /guides), markdown/MDX frontmatter, or an <article> element are only NON-EXHAUSTIVE hints — none is required: if it simply reads like an article, it qualifies (a marketing/landing/product page does NOT — that keeps make_images). You already hold the article you are working on → pass its own title + text as article_text (or article_url for a public link, or article_file for a local md/mdx/html/txt file). It generates the COVER, driven by the ARTICLE'S OWN specific subject (never a generic trade photo), kept visually coherent with the site's locked style (palette, light, medium), adapted to the site's country (driving side, architecture, currency), with NO recurring face/logo/product stamped on by default (every article gets a DIFFERENT scene — no 'same baker's face on every post'). Default = the cover ONLY at 16:9; set illustrations:N to also get N in-article images. Delivers an optimised WebP + ALT, ready to host. To DELIBERATELY feature a locked character/product, pass character/product. If the site has no locked style it infers one from the project; if it still lacks the trade/brand it tells you what to provide.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				article_text: {
+					type: "string",
+					description: "The article's text (title + body), pasted directly",
+				},
+				article_url: {
+					type: "string",
+					description: "Public URL of the article — its text is read for you",
+				},
+				article_file: {
+					type: "string",
+					description:
+						"Local file to read (md/mdx/html/txt…), relative to the project",
+				},
+				title: {
+					type: "string",
+					description:
+						"Optional article title (overrides the one read from the source)",
+				},
+				illustrations: {
+					type: "number",
+					description:
+						"Extra in-article images beyond the cover (default 0, max 5)",
+				},
+				orientation: {
+					type: "string",
+					enum: ["wide", "portrait", "square"],
+					description:
+						"Cover shape — default 'wide' (16:9, the standard blog-cover ratio). Use portrait/square only if the layout needs it.",
+				},
+				character: {
+					type: "string",
+					description:
+						"Optional: name/role of a locked character to deliberately feature",
+				},
+				product: {
+					type: "string",
+					description:
+						"Optional: name of a locked product to deliberately feature",
+				},
+				save_dir: {
+					type: "string",
+					description:
+						"Directory to save the WebP into (default <project>/public/images)",
+				},
+				project_dir: {
+					type: "string",
+					description: "Project path (default: current directory)",
+				},
+			},
 		},
 	},
 	{
@@ -1769,7 +1961,7 @@ const TOOLS = [
 			openWorldHint: true,
 		},
 		description:
-			"The site's art direction in one tool — action: 'setup' (lock the style from a short brief and/or the user's existing site_url; run FIRST on a new project, or let make_images infer it), 'refine' (plain-language feedback — « plus chaleureux » — becomes PERMANENT for every future image), 'lock_image' (« j'adore CELLE-LÀ, fais les autres pareil » — the approved image becomes the permanent style reference). Action inferred if omitted: image_path→lock_image, feedback→refine, otherwise setup. Free (optional moodboard billed as 1 image).",
+			"The site's art direction in one tool — action: 'setup' (lock the style from a short brief and/or the user's existing site_url; run FIRST on a new project, or let make_images infer it), 'refine' (plain-language feedback — « plus chaleureux », OR a CORRECTION of a wrong/off-topic depiction such as « un VTC est un chauffeur privé, jamais un taxi » or « montre toujours le pro au travail, pas un client » — the rule is RECORDED PERMANENTLY in the site's scene rules and obeyed by every future image, blog_cover included, so the same mistake is never reproduced), 'lock_image' (« j'adore CELLE-LÀ, fais les autres pareil » — the approved image becomes the permanent style reference). Action inferred if omitted: image_path→lock_image, feedback→refine, otherwise setup. Free (optional moodboard billed as 1 image).",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -1863,7 +2055,7 @@ const TOOLS = [
 			"Lock a recurring character, product or place (identical everywhere)",
 		annotations: {
 			readOnlyHint: false,
-			destructiveHint: false,
+			destructiveHint: true,
 			openWorldHint: true,
 		},
 		description:
@@ -1957,6 +2149,7 @@ const TOOLS = [
 const TOOL_RUNNERS = {
 	make_images: runMakeImages,
 	generate_image: runGenerateImage,
+	blog_cover: runBlogCover,
 	edit_image: runEditImage,
 	site_style: runSiteStyle,
 	brand_pack: runBrandPack,
@@ -1964,6 +2157,8 @@ const TOOL_RUNNERS = {
 	finish_images: runFinishImages,
 	pack_status: runPackStatus,
 	// Anciens noms — gardés en coulisse (compat tests / vieux clients).
+	blog_image: (a, p) => runBlogCover(a, p),
+	blog: (a, p) => runBlogCover(a, p),
 	setup_style: (a, p) => runSiteStyle({ ...a, action: "setup" }, p),
 	refine_style: (a, p) => runSiteStyle({ ...a, action: "refine" }, p),
 	lock_style_image: (a, p) => runSiteStyle({ ...a, action: "lock_image" }, p),
@@ -2054,8 +2249,10 @@ THE EASY PATH (prefer it): write the page with <img src="https://placehold.co/12
 Also:
 - User provides a person's photo ("c'est lui le professeur") → create_reference (kind character, photo_path) FIRST, so make_images/generate_image reuse that exact face in every scene. A product that must stay identical in every shot → create_reference (kind product). Never paste the raw photo into the page when a styled scene would serve better.
 - User gives style feedback ("plus chaleureux") → site_style (action refine): the change becomes permanent. User approves ONE image and wants the rest the SAME ("j'adore celle-là, fais les autres pareil") → site_style (action lock_image) with that file.
+- User points out the image got the SUBJECT/trade/role WRONG or off-topic (e.g. "a VTC is a private chauffeur, not a taxi", "show the baker working, not a customer", wrong product) → site_style (action refine) with that correction: it is recorded as a permanent scene rule and obeyed by EVERY future image (blog_cover included), so the same off-topic is never reproduced. Do this the moment a correction is given — never just regenerate and hope.
 - EXISTING site whose real images look cheap/stock/off-brand → make_images with rebrand:true: the first call lists every replaceable image for free, then apply:true rebrands them ALL in place (code untouched, originals kept as *.original).
 - REVIEW / TESTIMONIAL sections: just put a placeholder <img> next to each review and run make_images — the avatars come out as ultra-real casual smartphone selfies (UGC look: car, bedroom, living room…), NOT brand photos. Same reviewer name = same face everywhere on the site; a face is NEVER reused on another site. Never ship a review section without these avatars.
+- An EDITORIAL ARTICLE that still LACKS a cover/hero image → use blog_cover (NOT make_images, NOT placeholder stock). GUARDRAIL against noise: ONE cover per article, only when it is missing — if the article already has a real cover, leave it (never regenerate); a pure text/typo/SEO edit is NOT a trigger; never re-run on your own initiative (each call bills). Recognise it by MEANING, not by tags: any standalone piece written to be READ — a headline plus a body of prose on one topic (blog post, news, guide, tutorial, case study, magazine/journal piece) — in ANY language and on ANY stack (markdown/MDX, a headless CMS like WordPress/Sanity/Contentful, or a custom DB-driven route). Structural cues are only NON-EXHAUSTIVE hints, none of them required: folders/routes such as /blog /posts /articles /news /journal /actualités /magazine /guides, markdown/MDX frontmatter, or an <article> element — but if it simply READS like an article, it qualifies even with none of these. (It is the article body, not a marketing/landing/product page — those keep make_images.) You are the one writing/editing it, so you ALREADY have its text: pass its own title + body as article_text (or article_url / article_file). blog_cover reads the article, illustrates its SPECIFIC subject (not a generic trade photo), matches the site's locked style, adapts to the site's country (driving side, architecture…), and returns a 16:9 WebP + ALT. Default = the cover only; pass illustrations:N for in-article images. No style locked yet? it infers one from the project; if it still lacks the trade/brand it tells you what to provide — give it, don't guess.
 - One-off image → generate_image. Retouch/redo/cutout/upscale/widen an existing one → edit_image with the right action.
 - Finish a page properly: brand_pack (logo + favicon + og:image in ONE call) then finish_images (ALT auto-fixed + WebP optimisation, free).
 COST DISCIPLINE — NEVER iterate on your own. ONE make_images call dresses a page: the job is then DONE. Do NOT regenerate, redo, retouch or "improve" an image on your own initiative, do NOT call tools in a loop, do NOT re-run a call that succeeded — every generation bills the subscriber's credits and burns their tokens. Retouch or regenerate ONLY when the USER explicitly asks for it.
