@@ -15,10 +15,12 @@
 // Transport : MCP stdio (JSON-RPC 2.0 ligne à ligne), zéro dépendance.
 // ---------------------------------------------------------------------------
 
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import {
 	dirname,
 	extname,
@@ -119,6 +121,116 @@ const MIME_BY_EXT = {
 async function fileToDataUri(path) {
 	const mime = MIME_BY_EXT[extname(path).toLowerCase()] ?? "image/png";
 	return `data:${mime};base64,${(await readFile(path)).toString("base64")}`;
+}
+
+// --- presse-papier → image (le pont « je colle, ça marche ») --------------------
+// Quand l'utilisateur a COPIÉ une image (Ctrl/Cmd+C) au lieu de fournir un fichier,
+// un argument photo_path/image_path/source_path égal à "clipboard" lit directement
+// le presse-papier de la machine où tourne le MCP (le bureau de l'abonné) et l'écrit
+// en PNG temporaire. Zéro dépendance : on appelle l'outil natif de chaque OS.
+let clipSeq = 0;
+const CLIPBOARD_WORDS = new Set([
+	"clipboard",
+	"@clipboard",
+	":clipboard",
+	"paste",
+	"pasted",
+	"presse-papier",
+	"presse papier",
+	"colle",
+	"collé",
+	"collee",
+	"collée",
+	"copie",
+	"copié",
+	"copiee",
+	"copiée",
+]);
+const isClipboardRef = (v) =>
+	typeof v === "string" && CLIPBOARD_WORDS.has(v.trim().toLowerCase());
+
+function grabClipboardToPng() {
+	const outPath = join(
+		tmpdir(),
+		`distribea-clip-${process.pid}-${clipSeq}.png`
+	);
+	clipSeq += 1;
+	const plat = process.platform;
+	if (plat === "win32") {
+		const esc = outPath.replaceAll("'", "''");
+		const ps = `$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $i=[System.Windows.Forms.Clipboard]::GetImage(); if($null -eq $i){ exit 2 } $i.Save('${esc}',[System.Drawing.Imaging.ImageFormat]::Png); $i.Dispose()`;
+		spawnSync(
+			"powershell",
+			["-STA", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+			{ timeout: 15_000, windowsHide: true }
+		);
+	} else if (plat === "darwin") {
+		const lines = [
+			`set p to POSIX file "${outPath.replaceAll('"', '\\"')}"`,
+			"try",
+			"set d to (the clipboard as «class PNGf»)",
+			"on error",
+			'return "NO_IMAGE"',
+			"end try",
+			"set fh to open for access p with write permission",
+			"set eof fh to 0",
+			"write d to fh",
+			"close access fh",
+		];
+		const a = [];
+		for (const l of lines) {
+			a.push("-e", l);
+		}
+		spawnSync("osascript", a, { timeout: 15_000 });
+	} else {
+		const q = outPath.replaceAll("'", "'\\''");
+		spawnSync(
+			"sh",
+			[
+				"-c",
+				`wl-paste --type image/png > '${q}' 2>/dev/null || xclip -selection clipboard -t image/png -o > '${q}' 2>/dev/null`,
+			],
+			{ timeout: 15_000 }
+		);
+	}
+	let ok = false;
+	try {
+		ok = statSync(outPath).size > 0;
+	} catch {
+		// fichier non créé → rien d'exploitable dans le presse-papier
+	}
+	if (!ok) {
+		try {
+			unlinkSync(outPath);
+		} catch {
+			// rien à nettoyer
+		}
+		const hint =
+			plat === "linux"
+				? " (installe xclip ou wl-clipboard sur cette machine)"
+				: "";
+		throw new Error(
+			`Aucune image dans le presse-papier${hint}. Copie d'abord l'image (clic droit → Copier, ou Ctrl/Cmd+C) puis relance.`
+		);
+	}
+	return outPath;
+}
+
+// Transforme un argument « image » (chemin de fichier OU "clipboard") en data URI.
+async function imageArgToDataUri(projectDir, value) {
+	if (isClipboardRef(value)) {
+		const tmp = grabClipboardToPng();
+		try {
+			return await fileToDataUri(tmp);
+		} finally {
+			try {
+				unlinkSync(tmp);
+			} catch {
+				// nettoyage best-effort du PNG temporaire
+			}
+		}
+	}
+	return fileToDataUri(resolveIn(projectDir, value));
 }
 
 async function saveUrl(url, outPath) {
@@ -1092,9 +1204,8 @@ async function runSiteStyle(args, progress) {
 	}
 
 	if (action === "lock_image") {
-		const imagePath = resolveIn(projectDir, String(args.image_path ?? ""));
 		const out = await engine("style_lock_image", projectDir, {
-			image: await fileToDataUri(imagePath),
+			image: await imageArgToDataUri(projectDir, args.image_path),
 		});
 		return [
 			"Style ANCRÉ sur ton image ✔ — chaque nouvelle image recevra cette référence et répliquera exactement sa technique (0 crédit de génération).",
@@ -1161,7 +1272,7 @@ async function runCreateReference(args) {
 	);
 	const excerpt = pagesExcerpt(projectDir);
 	const photo = args.photo_path
-		? await fileToDataUri(resolveIn(projectDir, args.photo_path))
+		? await imageArgToDataUri(projectDir, args.photo_path)
 		: undefined;
 
 	if (args.kind === "product" || args.kind === "place") {
@@ -1239,7 +1350,7 @@ async function runBrandPack(args, progress) {
 	const doFavicons = async () => {
 		const out = await engine("favicons", projectDir, {
 			source: args.source_path
-				? await fileToDataUri(resolveIn(projectDir, args.source_path))
+				? await imageArgToDataUri(projectDir, args.source_path)
 				: undefined,
 			pages_excerpt: excerpt,
 			client_ref: "favicons",
@@ -2070,7 +2181,8 @@ const TOOLS = [
 				},
 				image_path: {
 					type: "string",
-					description: "lock_image: path of the approved image",
+					description:
+						'lock_image: path of the approved image — or "clipboard" to use the image you just copied',
 				},
 				project_dir: {
 					type: "string",
@@ -2113,7 +2225,8 @@ const TOOLS = [
 				},
 				source_path: {
 					type: "string",
-					description: "favicons: optional existing logo/icon to derive from",
+					description:
+						'favicons: optional existing logo/icon to derive from — a file path, or "clipboard" to use a copied image',
 				},
 				save_dir: { type: "string", description: "Default <project>/public" },
 				project_dir: {
@@ -2133,7 +2246,7 @@ const TOOLS = [
 			openWorldHint: true,
 		},
 		description:
-			"Lock a RECURRING reference reused identically across every image — kind 'character' (default): the same FACE everywhere, auto-cast or locked from a real photo via photo_path (« c'est lui le professeur » → call this FIRST so every scene reuses that exact face); kind 'product' (e-commerce): the exact same object in every shot; kind 'place': the brand's real location (shop, workshop…) rebuilt identically in every scene (« voilà ma boutique » → photo_path). make_images and generate_image use them automatically when their name appears near a slot.",
+			"Lock a RECURRING reference reused identically across every image — kind 'character' (default): the same FACE everywhere, auto-cast or locked from a real photo via photo_path — a file path, OR the word \"clipboard\" to grab the photo the user just copied/pasted (Ctrl/Cmd+C, no file needed) (« c'est lui le professeur », « voici sa photo » → call this FIRST so every scene reuses that exact face); kind 'product' (e-commerce): the exact same object in every shot; kind 'place': the brand's real location (shop, workshop…) rebuilt identically in every scene (« voilà ma boutique » → photo_path). make_images and generate_image use them automatically when their name appears near a slot.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -2155,7 +2268,7 @@ const TOOLS = [
 				photo_path: {
 					type: "string",
 					description:
-						"Optional absolute path to a real photo to lock (face, product or place)",
+						'Real photo to lock (face, product or place): a file path — OR the word "clipboard" to use the image the user just copied/pasted (Ctrl/Cmd+C), no file needed.',
 				},
 				project_dir: {
 					type: "string",
@@ -2321,7 +2434,7 @@ WHENEVER you create or modify a web page, section or component (landing page, he
 THE EASY PATH (prefer it): write the page with <img src="https://placehold.co/1200x600"> markers at every image spot, then ONE call to make_images(page_path) does everything — style locked or auto-inferred, all images generated IN PARALLEL, code patched. No page_path = the whole project. No setup needed: the style is inferred from the page itself if not locked.
 
 Also:
-- User provides a person's photo ("c'est lui le professeur") → create_reference (kind character, photo_path) FIRST, so make_images/generate_image reuse that exact face in every scene. A product that must stay identical in every shot → create_reference (kind product). Never paste the raw photo into the page when a styled scene would serve better.
+- User provides a person's photo ("c'est lui le professeur") → create_reference (kind character, photo_path) FIRST, so make_images/generate_image reuse that exact face in every scene. If the user COPIED or PASTED the photo instead of giving a file (a pasted image in the chat, "voici sa photo", "je l'ai collée") pass photo_path:"clipboard" — the MCP reads the image straight from the user's clipboard, no file path needed (same trick for site_style lock_image image_path and brand_pack favicons source_path). A product that must stay identical in every shot → create_reference (kind product). Never paste the raw photo into the page when a styled scene would serve better.
 - User gives style feedback ("plus chaleureux") → site_style (action refine): the change becomes permanent. User approves ONE image and wants the rest the SAME ("j'adore celle-là, fais les autres pareil") → site_style (action lock_image) with that file.
 - User points out the image got the SUBJECT/trade/role WRONG or off-topic (e.g. "a VTC is a private chauffeur, not a taxi", "show the baker working, not a customer", wrong product) → site_style (action refine) with that correction: it is recorded as a permanent scene rule and obeyed by EVERY future image (blog_cover included), so the same off-topic is never reproduced. Do this the moment a correction is given — never just regenerate and hope.
 - EXISTING site whose real images look cheap/stock/off-brand → make_images with rebrand:true: the first call lists every replaceable image for free, then apply:true rebrands them ALL in place (code untouched, originals kept as *.original).
@@ -2353,7 +2466,7 @@ async function handle(msg) {
 				serverInfo: {
 					name: "distribea-mcp",
 					title: "Distribea MCP",
-					version: "1.2.0",
+					version: "1.4.0",
 				},
 				instructions: INSTRUCTIONS,
 			},
