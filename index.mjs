@@ -17,7 +17,14 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import {
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -46,6 +53,11 @@ if (!TOKEN) {
 }
 
 const TOOL_TIMEOUT_MS = 280_000; // clients MCP coupent à 300 s
+// Arrêt PROPRE de make_images 30 s avant le watchdog brutal : les jobs en cours
+// finissent, les slots non démarrés sont gardés pour la prochaine relance, et
+// l'utilisateur reçoit une réponse normale "X/N branchées, relance pour le
+// reste" au lieu d'une erreur (cf incident 2026-06-14 timeout > 4 min 40).
+const MAKE_IMAGES_SOFT_DEADLINE_MS = 250_000;
 const ENGINE_TIMEOUT_MS = 270_000;
 const MAX_RESULT_CHARS = 80_000; // limite ~25k tokens côté clients MCP
 const IMAGE_CREDITS_HINT = 55; // affichage seulement — le PRIX réel est serveur
@@ -528,6 +540,24 @@ function isReviewAvatarSlot(slot) {
 	return slot.orientation !== "landscape";
 }
 
+// Signature d'avis (texte qui SUIT l'image — prénom + commentaire de l'auteur).
+// Le MÊME avis répété dans 2 sections de la même page partage UN seul avatar
+// (1 génération facturée, branchée à tous les emplacements du groupe). Null si
+// pas un avis ou texte trop court pour être une signature fiable.
+function reviewSignature(slot) {
+	if (!isReviewAvatarSlot(slot)) {
+		return null;
+	}
+	const txt = String(slot.after ?? "")
+		.toLowerCase()
+		.replace(/\s+/g, " ")
+		.trim();
+	if (txt.length < 16) {
+		return null;
+	}
+	return txt.slice(0, 200);
+}
+
 function resolveImageRef(projectDir, codeFile, src) {
 	if (/^(https?:|data:|\/\/)/.test(src)) {
 		return null;
@@ -728,6 +758,68 @@ function describeResult(projectDir, r) {
 	return `• ${r.fileName} (${r.dims.width}×${r.dims.height}${who}) — ${r.alt}`;
 }
 
+// --- verrou anti-double-débit make_images --------------------------------------
+// Quand le client MCP (Claude Code / Cursor) coupe l'appel make_images au
+// timeout (~3 min) alors que la génération continue côté moteur, l'agent hôte
+// relance souvent l'outil pour « finir le travail ». Sans garde-fou, il
+// rescanne la page : comme les premières images ne sont pas encore branchées,
+// il les voit comme manquantes → il en REFACTURE un 2e lot. Résultat : crédits
+// doublés et fichiers orphelins sur disque. Le verrou ci-dessous refuse tout
+// 2e appel sur la même page tant que le 1er n'a pas rendu la main (ou que le
+// verrou n'a pas expiré).
+const MAKE_IMAGES_LOCK_MS = 10 * 60 * 1000;
+function makeImagesLockPath(projectDir, pagePath) {
+	const key = pagePath
+		? `page-${createHash("sha1").update(String(pagePath)).digest("hex").slice(0, 10)}`
+		: "project";
+	return join(projectDir, ".distribea-shots", `make_images-${key}.lock`);
+}
+function acquireMakeImagesLock(projectDir, pagePath) {
+	const lockPath = makeImagesLockPath(projectDir, pagePath);
+	mkdirSync(dirname(lockPath), { recursive: true });
+	const stamp = JSON.stringify({
+		startedAt: Date.now(),
+		pid: process.pid,
+		pagePath: pagePath ? String(pagePath) : null,
+	});
+	try {
+		writeFileSync(lockPath, stamp, { flag: "wx" });
+		return lockPath;
+	} catch (e) {
+		if (e.code !== "EEXIST") {
+			throw e;
+		}
+	}
+	let prev = null;
+	try {
+		prev = JSON.parse(readFileSync(lockPath, "utf8"));
+	} catch {
+		// fichier corrompu → on prend la main
+	}
+	const age = prev?.startedAt
+		? Date.now() - prev.startedAt
+		: Number.POSITIVE_INFINITY;
+	if (age < MAKE_IMAGES_LOCK_MS) {
+		const ageSec = Math.round(age / 1000);
+		const remaining = Math.ceil((MAKE_IMAGES_LOCK_MS - age) / 60_000);
+		const target = pagePath
+			? `cette page (${relative(projectDir, pagePath)})`
+			: "ce projet";
+		throw new Error(
+			`⏳ make_images TOURNE DÉJÀ pour ${target} (démarrée il y a ${ageSec}s). NE LANCE PAS un 2e appel — ça facturerait les mêmes images en double. Attends la fin (verrou auto-libéré au plus tard dans ${remaining} min), puis relance : les images déjà branchées seront détectées et NON refacturées.`
+		);
+	}
+	writeFileSync(lockPath, stamp);
+	return lockPath;
+}
+function releaseMakeImagesLock(lockPath) {
+	try {
+		unlinkSync(lockPath);
+	} catch {
+		// déjà supprimé ou non créé → rien à faire
+	}
+}
+
 // --- runners : les 8 portes -----------------------------------------------------
 async function runMakeImages(args, progress) {
 	if (args.rebrand) {
@@ -741,182 +833,275 @@ async function runMakeImages(args, progress) {
 	const pagePath = pageMode
 		? resolveIn(projectDir, String(args.page_path))
 		: null;
-	const maxImages = Math.max(1, Math.min(20, Number(args.max_images ?? 10)));
-	const saveDir = args.save_dir
-		? resolveIn(projectDir, args.save_dir)
-		: join(projectDir, "public", "images");
-	const prefix = String(args.public_prefix ?? "/images/");
+	const lockPath = acquireMakeImagesLock(projectDir, pagePath);
+	try {
+		const maxImages = Math.max(1, Math.min(20, Number(args.max_images ?? 10)));
+		const saveDir = args.save_dir
+			? resolveIn(projectDir, args.save_dir)
+			: join(projectDir, "public", "images");
+		const prefix = String(args.public_prefix ?? "/images/");
 
-	const allSlots = pageMode
-		? scanFileForSlots(pagePath, readFileSync(pagePath, "utf8"))
-		: walkFiles(projectDir).flatMap((f) =>
-				scanFileForSlots(f, readFileSync(f, "utf8"))
-			);
-	if (!allSlots.length) {
-		return pageMode
-			? `Aucun placeholder/stock trouvé sur ${relative(projectDir, pagePath)}. Écris d'abord des <img src="https://placehold.co/…"> aux emplacements voulus puis relance make_images — ou utilise generate_image pour un sujet libre.`
-			: "No placeholder or stock images found — nothing to fill.";
-	}
-	const slots = allSlots.slice(0, maxImages);
-
-	if (args.dry_run) {
-		return [
-			`Found ${allSlots.length} placeholder/stock slot(s)${allSlots.length > slots.length ? ` (would fill the first ${slots.length})` : ""}:`,
-			...slots.map(
-				(s, i) =>
-					`${i + 1}. ${relative(projectDir, s.file)} — ${s.src.slice(0, 70)} [${s.orientation}]${s.heading ? ` — section: "${s.heading}"` : ""}`
-			),
-			`🧾 Devis : ${slots.length} image(s) ≈ ${slots.length * IMAGE_CREDITS_HINT} crédits de ton abonnement (les avatars déjà connus ressortent à 0 crédit).`,
-			"Run again without dry_run to generate.",
-		].join("\n");
-	}
-
-	// Garde-fou solde (affichage) — le verdict FINAL reste côté serveur.
-	const status = await engine("status", projectDir, {});
-	const estimate = slots.length * IMAGE_CREDITS_HINT;
-	if (status.balance < estimate) {
-		throw new Error(
-			`🚫 Solde insuffisant pour ${slots.length} image(s) (≈ ${estimate} crédits, solde: ${status.balance} crédits). Recharge sur ${APP_URL}/account/billing ou baisse max_images.`
-		);
-	}
-	// Devis annoncé AVANT de lancer — en crédits de l'abonnement, jamais en argent.
-	progress?.(
-		`🧾 Devis : ${slots.length} image(s) ≈ ${estimate} crédits — solde ${status.balance} crédits. Lancement…`,
-		0,
-		slots.length
-	);
-
-	// Révélation avant/après (si le projet de l'abonné a playwright+sharp).
-	let beforeShot = null;
-	if (pageMode) {
-		try {
-			beforeShot = await screenshotPage(
-				projectDir,
-				pagePath,
-				join(projectDir, ".distribea-shots", "before.png")
-			);
-		} catch (e) {
-			logErr(`screenshot avant impossible: ${e.message}`);
-		}
-	}
-
-	const excerpt = pagesExcerpt(projectDir);
-	// Branchement IMMÉDIAT par image (écritures fichier sérialisées, générations
-	// parallèles) : si la connexion coupe au milieu du lot, les images déjà
-	// payées sont DÉJÀ dans le code → relancer ne refait que ce qui manque.
-	let patchChain = Promise.resolve();
-	const patchOne = (r) => {
-		const job = patchChain.then(async () => {
-			const current = readFileSync(r.slot.file, "utf8");
-			if (!current.includes(r.slot.tag)) {
-				throw new Error(
-					"emplacement introuvable (fichier modifié pendant la génération)"
+		const allSlots = pageMode
+			? scanFileForSlots(pagePath, readFileSync(pagePath, "utf8"))
+			: walkFiles(projectDir).flatMap((f) =>
+					scanFileForSlots(f, readFileSync(f, "utf8"))
 				);
-			}
-			await writeFile(
-				r.slot.file,
-				current.replace(
-					r.slot.tag,
-					patchTag(
-						r.slot.tag,
-						r.slot.src,
-						`${prefix}${r.fileName}`,
-						r.alt,
-						r.dims
-					)
-				)
-			);
-		});
-		patchChain = job.catch(() => {});
-		return job;
-	};
-
-	let doneCount = 0;
-	const failures = [];
-	const settled = await mapPool(slots, 3, async (slot, idx) => {
-		try {
-			const r = await generateSlotImage(
-				projectDir,
-				slot,
-				saveDir,
-				`${slugify(slot.heading || slot.alt || "image")}-${String(idx + 1).padStart(2, "0")}`,
-				excerpt
-			);
-			await patchOne(r);
-			doneCount += 1;
-			progress?.(
-				`✔ ${doneCount}/${slots.length} — ${r.fileName} branchée`,
-				doneCount,
-				slots.length
-			);
-			return r;
-		} catch (e) {
-			doneCount += 1;
-			failures.push({ slot, message: e.message });
-			progress?.(
-				`✗ ${doneCount}/${slots.length} — ${relative(projectDir, slot.file)} : ${e.message}`,
-				doneCount,
-				slots.length
-			);
-			return null;
+		if (!allSlots.length) {
+			return pageMode
+				? `Aucun placeholder/stock trouvé sur ${relative(projectDir, pagePath)}. Écris d'abord des <img src="https://placehold.co/…"> aux emplacements voulus puis relance make_images — ou utilise generate_image pour un sujet libre.`
+				: "No placeholder or stock images found — nothing to fill.";
 		}
-	});
-	const results = settled.filter(Boolean);
-	if (!results.length) {
-		throw new Error(
-			`Aucune image générée — ${failures[0]?.message ?? "erreur inconnue"}. Relance make_images : rien n'a été débité en double.`
-		);
-	}
+		const slots = allSlots.slice(0, maxImages);
 
-	const images = [];
-	if (pageMode && beforeShot) {
-		try {
-			const afterShot = await screenshotPage(
-				projectDir,
-				pagePath,
-				join(projectDir, ".distribea-shots", "after.png")
+		// Partage d'avatars d'avis : si le MÊME texte d'avis apparaît dans 2
+		// emplacements de la page (hero + section avis, par exemple), on génère
+		// UN seul visage et on le branche partout. Désactivable avec
+		// share_avatars: false (chaque emplacement régénère son propre visage).
+		const shareAvatars = args.share_avatars !== false;
+		const leaderSlots = [];
+		// followerSlots: emplacements qui réutiliseront le résultat d'un leader.
+		const followerSlots = [];
+		// sigLeaderIndex: signature → index du leader dans leaderSlots.
+		const sigLeaderIndex = new Map();
+		for (const slot of slots) {
+			const sig = shareAvatars ? reviewSignature(slot) : null;
+			if (sig && sigLeaderIndex.has(sig)) {
+				followerSlots.push({ slot, leaderIdx: sigLeaderIndex.get(sig) });
+				continue;
+			}
+			if (sig) {
+				sigLeaderIndex.set(sig, leaderSlots.length);
+			}
+			leaderSlots.push(slot);
+		}
+		const sharedCount = followerSlots.length;
+
+		if (args.dry_run) {
+			return [
+				`Found ${allSlots.length} placeholder/stock slot(s)${allSlots.length > slots.length ? ` (would fill the first ${slots.length})` : ""}:`,
+				...slots.map(
+					(s, i) =>
+						`${i + 1}. ${relative(projectDir, s.file)} — ${s.src.slice(0, 70)} [${s.orientation}]${s.heading ? ` — section: "${s.heading}"` : ""}`
+				),
+				sharedCount
+					? `🤝 Avis répétés détectés : ${sharedCount} emplacement(s) partageront l'avatar d'un autre (0 crédit). Désactive avec share_avatars: false.`
+					: "",
+				`🧾 Devis : ${leaderSlots.length} image(s) à générer ≈ ${leaderSlots.length * IMAGE_CREDITS_HINT} crédits${sharedCount ? ` (+ ${sharedCount} branchée(s) en réutilisation, 0 crédit)` : ""}. Les avatars déjà connus du site ressortent aussi à 0 crédit.`,
+				"Run again without dry_run to generate.",
+			]
+				.filter(Boolean)
+				.join("\n");
+		}
+
+		// Garde-fou solde (affichage) — le verdict FINAL reste côté serveur.
+		const status = await engine("status", projectDir, {});
+		const estimate = leaderSlots.length * IMAGE_CREDITS_HINT;
+		if (status.balance < estimate) {
+			throw new Error(
+				`🚫 Solde insuffisant pour ${leaderSlots.length} image(s) à générer (≈ ${estimate} crédits, solde: ${status.balance} crédits). Recharge sur ${APP_URL}/account/billing ou baisse max_images.`
 			);
-			if (afterShot) {
-				const reveal = await compositeBeforeAfter(
+		}
+		// Devis annoncé AVANT de lancer — en crédits de l'abonnement, jamais en argent.
+		progress?.(
+			`🧾 Devis : ${leaderSlots.length} image(s) ≈ ${estimate} crédits${sharedCount ? ` (+ ${sharedCount} avatar(s) partagé(s) = 0 crédit)` : ""} — solde ${status.balance} crédits. Lancement…`,
+			0,
+			leaderSlots.length
+		);
+
+		// Révélation avant/après (si le projet de l'abonné a playwright+sharp).
+		let beforeShot = null;
+		if (pageMode) {
+			try {
+				beforeShot = await screenshotPage(
 					projectDir,
-					beforeShot,
-					afterShot,
-					join(projectDir, ".distribea-shots", `avant-apres-${Date.now()}.jpg`)
+					pagePath,
+					join(projectDir, ".distribea-shots", "before.png")
 				);
-				if (reveal) {
-					images.push(reveal);
-				}
+			} catch (e) {
+				logErr(`screenshot avant impossible: ${e.message}`);
 			}
-		} catch (e) {
-			logErr(`révélation avant/après impossible: ${e.message}`);
 		}
-	}
 
-	const billed = results.filter((r) => !r.reused).length;
-	return {
-		text: [
-			results.some((r) => r.styleInferred) ? STYLE_INFERRED_NOTE : "",
-			`${pageMode ? `Page habillée ${failures.length ? "(partiellement)" : "✔"} — ${results.length} image(s) générées EN PARALLÈLE et branchées dans ${relative(projectDir, pagePath)}` : `Filled ${results.length}/${allSlots.length} placeholder/stock slot(s) ${failures.length ? "(partiel)" : "✔"}`} (${billed} image(s) facturée(s))`,
-			...results.map((r) => describeResult(projectDir, r)),
-			failures.length
-				? [
-						`⚠ ${failures.length} image(s) non générées :`,
-						...failures.map(
-							(f) =>
-								`  ✗ ${relative(projectDir, f.slot.file)}${f.slot.heading ? ` ("${f.slot.heading}")` : ""} — ${f.message}`
-						),
-						"→ Relance make_images : les images déjà branchées ne sont PAS refaites (0 crédit en plus), seuls les emplacements restants seront générés.",
-					].join("\n")
-				: "",
-			allSlots.length > slots.length
-				? `⚠ ${allSlots.length - slots.length} slot(s) left unfilled (max_images) — run again to continue.`
-				: "",
-			images.length ? "Révélation avant/après ci-dessous 👇" : "",
-		]
-			.filter(Boolean)
-			.join("\n"),
-		images,
-	};
+		const excerpt = pagesExcerpt(projectDir);
+		// Branchement IMMÉDIAT par image (écritures fichier sérialisées, générations
+		// parallèles) : si la connexion coupe au milieu du lot, les images déjà
+		// payées sont DÉJÀ dans le code → relancer ne refait que ce qui manque.
+		let patchChain = Promise.resolve();
+		const patchOne = (r) => {
+			const job = patchChain.then(async () => {
+				const current = readFileSync(r.slot.file, "utf8");
+				if (!current.includes(r.slot.tag)) {
+					throw new Error(
+						"emplacement introuvable (fichier modifié pendant la génération)"
+					);
+				}
+				await writeFile(
+					r.slot.file,
+					current.replace(
+						r.slot.tag,
+						patchTag(
+							r.slot.tag,
+							r.slot.src,
+							`${prefix}${r.fileName}`,
+							r.alt,
+							r.dims
+						)
+					)
+				);
+			});
+			patchChain = job.catch(() => {});
+			return job;
+		};
+
+		let doneCount = 0;
+		const failures = [];
+		// Soft deadline : 30 s avant le watchdog brutal. Les slots non démarrés
+		// sont gardés pour la prochaine relance — l'utilisateur reçoit une
+		// réponse normale "X/N branchées, relance pour le reste" au lieu d'une
+		// erreur (cf incident 2026-06-14 > 4 min 40).
+		const softDeadline = Date.now() + MAKE_IMAGES_SOFT_DEADLINE_MS;
+		const skipped = [];
+		const settled = await mapPool(leaderSlots, 3, async (slot, idx) => {
+			if (Date.now() > softDeadline) {
+				skipped.push(slot);
+				doneCount += 1;
+				progress?.(
+					`⏸ ${doneCount}/${leaderSlots.length} — ${relative(projectDir, slot.file)} (sautée, à relancer)`,
+					doneCount,
+					leaderSlots.length
+				);
+				return null;
+			}
+			try {
+				const r = await generateSlotImage(
+					projectDir,
+					slot,
+					saveDir,
+					`${slugify(slot.heading || slot.alt || "image")}-${String(idx + 1).padStart(2, "0")}`,
+					excerpt
+				);
+				await patchOne(r);
+				doneCount += 1;
+				progress?.(
+					`✔ ${doneCount}/${leaderSlots.length} — ${r.fileName} branchée`,
+					doneCount,
+					leaderSlots.length
+				);
+				return r;
+			} catch (e) {
+				doneCount += 1;
+				failures.push({ slot, message: e.message });
+				progress?.(
+					`✗ ${doneCount}/${leaderSlots.length} — ${relative(projectDir, slot.file)} : ${e.message}`,
+					doneCount,
+					leaderSlots.length
+				);
+				return null;
+			}
+		});
+		const results = settled.filter(Boolean);
+		if (!(results.length || skipped.length)) {
+			throw new Error(
+				`Aucune image générée — ${failures[0]?.message ?? "erreur inconnue"}. Relance make_images : rien n'a été débité en double.`
+			);
+		}
+
+		// Branche les emplacements PARTAGÉS sur le visage de leur leader (avis
+		// répétés dans la page). Le leader a été généré au-dessus ; ici on
+		// patche le tag du follower avec le MÊME fichier WebP : 0 appel moteur,
+		// 0 crédit. Si le leader a échoué, le follower est marqué en erreur.
+		for (const { slot, leaderIdx } of followerSlots) {
+			const leader = settled[leaderIdx];
+			if (!leader) {
+				failures.push({
+					slot,
+					message:
+						"avatar partagé indisponible (génération du leader a échoué)",
+				});
+				continue;
+			}
+			const shared = {
+				slot,
+				fileName: leader.fileName,
+				outPath: leader.outPath,
+				alt: leader.alt,
+				dims: leader.dims,
+				reused: true,
+				reviewer: leader.reviewer,
+				character: leader.character,
+				credits: 0,
+				styleInferred: leader.styleInferred,
+			};
+			try {
+				await patchOne(shared);
+				results.push(shared);
+			} catch (e) {
+				failures.push({ slot, message: e.message });
+			}
+		}
+
+		const images = [];
+		if (pageMode && beforeShot) {
+			try {
+				const afterShot = await screenshotPage(
+					projectDir,
+					pagePath,
+					join(projectDir, ".distribea-shots", "after.png")
+				);
+				if (afterShot) {
+					const reveal = await compositeBeforeAfter(
+						projectDir,
+						beforeShot,
+						afterShot,
+						join(
+							projectDir,
+							".distribea-shots",
+							`avant-apres-${Date.now()}.jpg`
+						)
+					);
+					if (reveal) {
+						images.push(reveal);
+					}
+				}
+			} catch (e) {
+				logErr(`révélation avant/après impossible: ${e.message}`);
+			}
+		}
+
+		const billed = results.filter((r) => !r.reused).length;
+		const sharedNote = sharedCount
+			? ` — dont ${sharedCount} avis partagé(s) (0 crédit)`
+			: "";
+		return {
+			text: [
+				results.some((r) => r.styleInferred) ? STYLE_INFERRED_NOTE : "",
+				`${pageMode ? `Page habillée ${failures.length ? "(partiellement)" : "✔"} — ${results.length} emplacement(s) branché(s) dans ${relative(projectDir, pagePath)}` : `Filled ${results.length}/${allSlots.length} placeholder/stock slot(s) ${failures.length ? "(partiel)" : "✔"}`} (${billed} image(s) facturée(s)${sharedNote})`,
+				...results.map((r) => describeResult(projectDir, r)),
+				failures.length
+					? [
+							`⚠ ${failures.length} image(s) non générées :`,
+							...failures.map(
+								(f) =>
+									`  ✗ ${relative(projectDir, f.slot.file)}${f.slot.heading ? ` ("${f.slot.heading}")` : ""} — ${f.message}`
+							),
+							"→ Relance make_images : les images déjà branchées ne sont PAS refaites (0 crédit en plus), seuls les emplacements restants seront générés.",
+						].join("\n")
+					: "",
+				skipped.length
+					? `⏸ ${skipped.length} image(s) sautée(s) pour rester sous le budget temps (4 min 10) — RELANCE le même appel : les déjà-branchées seront ignorées, seules les restantes seront générées (0 crédit en double).`
+					: "",
+				allSlots.length > slots.length
+					? `⚠ ${allSlots.length - slots.length} slot(s) left unfilled (max_images) — run again to continue.`
+					: "",
+				images.length ? "Révélation avant/après ci-dessous 👇" : "",
+			]
+				.filter(Boolean)
+				.join("\n"),
+			images,
+		};
+	} finally {
+		releaseMakeImagesLock(lockPath);
+	}
 }
 
 async function runGenerateImage(args, progress) {
@@ -1863,7 +2048,20 @@ async function runRebrandImages(args, progress) {
 	const excerpt = pagesExcerpt(projectDir);
 	let doneCount = 0;
 	const failures = [];
+	// Même soft deadline que runMakeImages — voir commentaire là-bas.
+	const softDeadline = Date.now() + MAKE_IMAGES_SOFT_DEADLINE_MS;
+	const skipped = [];
 	const settled = await mapPool(candidates, 3, async (c) => {
+		if (Date.now() > softDeadline) {
+			skipped.push(c);
+			doneCount += 1;
+			progress?.(
+				`⏸ ${doneCount}/${candidates.length} — ${relative(projectDir, c.path)} (sautée, à relancer)`,
+				doneCount,
+				candidates.length
+			);
+			return null;
+		}
 		try {
 			const beforeBuf = await readFile(c.path);
 			const out = await engine("rebrand_one", projectDir, {
@@ -1900,7 +2098,7 @@ async function runRebrandImages(args, progress) {
 		}
 	});
 	const results = settled.filter(Boolean);
-	if (!results.length) {
+	if (!(results.length || skipped.length)) {
 		throw new Error(
 			`Aucune image rebrandée — ${failures[0]?.message ?? "erreur inconnue"}. Relance le même appel : ce qui a déjà été fait n'est jamais refacturé.`
 		);
@@ -1921,6 +2119,9 @@ async function runRebrandImages(args, progress) {
 					),
 					"→ Relance le même appel (rebrand: true, apply: true) : les images déjà faites sont automatiquement sautées, 0 crédit en double.",
 				].join("\n")
+			: "",
+		skipped.length
+			? `⏸ ${skipped.length} image(s) sautée(s) pour rester sous le budget temps (4 min 10) — RELANCE le même appel : les déjà-rebrandées sont automatiquement sautées (0 crédit en double).`
 			: "",
 		...notes,
 	]
@@ -1977,6 +2178,11 @@ const TOOLS = [
 				public_prefix: {
 					type: "string",
 					description: "Src prefix written in code (default /images/)",
+				},
+				share_avatars: {
+					type: "boolean",
+					description:
+						"Default true: a review repeated in two sections of the SAME page generates ONE face and reuses it (saves credits). Pass false to regenerate each one (use only if the user explicitly asks for a different face per slot).",
 				},
 			},
 		},
