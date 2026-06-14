@@ -219,10 +219,10 @@ function grabClipboardToPng() {
 		}
 		const hint =
 			plat === "linux"
-				? " (installe xclip ou wl-clipboard sur cette machine)"
+				? " (install xclip or wl-clipboard on this machine)"
 				: "";
 		throw new Error(
-			`Aucune image dans le presse-papier${hint}. Copie d'abord l'image (clic droit → Copier, ou Ctrl/Cmd+C) puis relance.`
+			`No image in the clipboard${hint}. Copy the image first (right-click → Copy, or Ctrl/Cmd+C) then try again.`
 		);
 	}
 	return outPath;
@@ -248,7 +248,7 @@ async function imageArgToDataUri(projectDir, value) {
 async function saveUrl(url, outPath) {
 	const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
 	if (!res.ok) {
-		throw new Error(`téléchargement impossible (HTTP ${res.status}) — ${url}`);
+		throw new Error(`download failed (HTTP ${res.status}) — ${url}`);
 	}
 	const buf = Buffer.from(await res.arrayBuffer());
 	await mkdir(dirname(outPath), { recursive: true });
@@ -282,7 +282,7 @@ async function engine(op, projectDir, payload = {}) {
 		});
 	} catch (e) {
 		throw new Error(
-			`⚠ Le moteur Distribea ne répond pas (${APP_URL}) : ${e.message}. Vérifie ta connexion puis réessaie.`
+			`⚠ The Distribea engine is not responding (${APP_URL}): ${e.message}. Check your connection then try again.`
 		);
 	}
 	const data = await res.json().catch(() => ({}));
@@ -297,25 +297,25 @@ async function engine(op, projectDir, payload = {}) {
 	}
 	if (res.status === 401) {
 		throw new Error(
-			`🔑 Cette clé n'est plus valide (elle a été régénérée ou révoquée). Récupère le nouveau bloc sur ${APP_URL}/account/mcp et recolle-le dans ton outil.`
+			`🔑 This key is no longer valid (it was regenerated or revoked). Get the new block at ${APP_URL}/account/mcp and paste it back into your tool.`
 		);
 	}
 	if (res.status === 402) {
 		throw new Error(
-			`🚫 Crédits insuffisants sur ton compte Distribea (cette opération coûte ${data.credits ?? "?"} crédits). Recharge ou passe à une formule supérieure : ${APP_URL}/account/billing`
+			`🚫 Not enough credits on your Distribea account (this operation costs ${data.credits ?? "?"} credits). Top up or upgrade your plan: ${APP_URL}/account/billing`
 		);
 	}
 	if (res.status === 429) {
 		if (data.reason === "rate_limited") {
 			throw new Error(
-				"⏳ Beaucoup de demandes d'un coup — le service régule la cadence. Attends une minute puis reprends là où tu en étais."
+				"⏳ Too many requests at once — the service is throttling. Wait a minute then pick up where you left off."
 			);
 		}
 		throw new Error(
-			`🛑 Plafond journalier atteint sur ton compte Distribea (${data.cap ?? "?"} opérations/jour). Réessaie demain.`
+			`🛑 Daily cap reached on your Distribea account (${data.cap ?? "?"} operations/day). Try again tomorrow.`
 		);
 	}
-	throw new Error(data.message ?? `Erreur moteur (HTTP ${res.status})`);
+	throw new Error(data.message ?? `Engine error (HTTP ${res.status})`);
 }
 
 // Extrait des pages du projet — envoyé au moteur pour qu'il déduise le style
@@ -495,7 +495,9 @@ function scanFileForSlots(file, content) {
 		let w = wM ? Number(wM[1]) : null;
 		let h = hM ? Number(hM[1]) : null;
 		if (!(w && h)) {
-			const dimM = srcM[1].match(/(\d{2,4})[x/](\d{2,4})/);
+			// srcM[2] = l'URL (srcM[1] = le guillemet capturé) : lit les dimensions
+			// encodées dans le placeholder, ex. placehold.co/1200x600 → 1200×600.
+			const dimM = srcM[2].match(/(\d{2,4})[x/](\d{2,4})/);
 			if (dimM) {
 				w = Number(dimM[1]);
 				h = Number(dimM[2]);
@@ -518,6 +520,9 @@ function scanFileForSlots(file, content) {
 				content.slice(m.index + tag.length, m.index + tag.length + 500)
 			).slice(0, 250),
 			orientation: orientationOf(w, h, tag),
+			// Ratio réel de l'emplacement → le moteur génère au format le plus
+			// proche pour que `object-fit: cover` ne rogne pas le produit.
+			ratio: w && h ? w / h : null,
 		});
 	}
 	return slots;
@@ -696,14 +701,45 @@ async function compositeBeforeAfter(projectDir, beforePng, afterPng, outPath) {
 }
 
 // --- générations (toutes via le moteur hébergé) ---------------------------------
-// Les avatars UGC sont SÉRIALISÉS : le 2e « Marie » d'une page doit retrouver
-// le visage du 1er même quand la page se génère en parallèle.
-let avatarChain = Promise.resolve();
-function engineUgcSerialized(projectDir, payload) {
-	const job = avatarChain
+// Avatars UGC sérialisés PAR IDENTITÉ (et non plus globalement) : deux clients
+// DIFFÉRENTS se génèrent en parallèle ; deux cartes qui pointent vers le MÊME
+// prénom restent en file (la 2e réutilise le visage de la 1re → 0 re-débit).
+// Prénom illisible → file partagée « __anon__ » (prudent : sérialisé, jamais de
+// re-débit). La clé est devinée côté client à partir du texte qui suit la photo.
+const avatarChains = new Map();
+const NAME_WORD_RE = /^[A-Za-zÀ-ÿ'’.-]{2,}$/;
+function reviewerNameKey(slot) {
+	const after = String(slot.after ?? "")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (!after) {
+		return null;
+	}
+	// Le nom de l'auteur est juste après la photo : 1 à 3 mots à initiale
+	// majuscule (lettres latines + accents, tiret/apostrophe).
+	const name = [];
+	for (const w of after.split(" ")) {
+		const c = w.charCodeAt(0);
+		const startsUpper = (c >= 0x41 && c <= 0x5a) || (c >= 0xc0 && c <= 0xdd);
+		if (startsUpper && NAME_WORD_RE.test(w)) {
+			name.push(w);
+			if (name.length === 3) {
+				break;
+			}
+		} else if (name.length) {
+			break;
+		}
+	}
+	const key = name.join(" ").toLowerCase();
+	return key.length >= 2 ? key : null;
+}
+function engineUgcSerialized(projectDir, payload, nameKey) {
+	const key = nameKey || "__anon__";
+	const prev = avatarChains.get(key) ?? Promise.resolve();
+	const job = prev
 		.catch(() => {})
 		.then(() => engine("ugc_avatar", projectDir, payload));
-	avatarChain = job;
+	avatarChains.set(key, job);
 	return job;
 }
 
@@ -716,6 +752,7 @@ async function generateSlotImage(projectDir, slot, saveDir, fileBase, excerpt) {
 			after: slot.after,
 			alt: slot.alt,
 			orientation: slot.orientation,
+			ratio: slot.ratio,
 			file: relative(projectDir, slot.file),
 		},
 		pages_excerpt: excerpt,
@@ -725,7 +762,7 @@ async function generateSlotImage(projectDir, slot, saveDir, fileBase, excerpt) {
 	let isAvatar = false;
 	if (isReviewAvatarSlot(slot)) {
 		isAvatar = true;
-		out = await engineUgcSerialized(projectDir, payload);
+		out = await engineUgcSerialized(projectDir, payload, reviewerNameKey(slot));
 	} else {
 		out = await engine("shot", projectDir, payload);
 	}
@@ -747,13 +784,13 @@ async function generateSlotImage(projectDir, slot, saveDir, fileBase, excerpt) {
 }
 
 const STYLE_INFERRED_NOTE =
-	"🎨 Style déduit automatiquement de tes pages (ajuste avec site_style action refine si besoin)";
+	"🎨 Style inferred automatically from your pages (adjust with site_style action refine if needed)";
 
 function describeResult(projectDir, r) {
 	const who = r.reviewer
-		? `, avatar UGC: ${r.reviewer}${r.reused ? " (réutilisé, 0 crédit)" : ""}`
+		? `, UGC avatar: ${r.reviewer}${r.reused ? " (reused, 0 credits)" : ""}`
 		: r.character
-			? `, personnage: ${r.character}`
+			? `, character: ${r.character}`
 			: "";
 	return `• ${r.fileName} (${r.dims.width}×${r.dims.height}${who}) — ${r.alt}`;
 }
@@ -784,7 +821,7 @@ function acquireMakeImagesLock(projectDir, pagePath) {
 	});
 	try {
 		writeFileSync(lockPath, stamp, { flag: "wx" });
-		return lockPath;
+		return { lockPath };
 	} catch (e) {
 		if (e.code !== "EEXIST") {
 			throw e;
@@ -803,20 +840,66 @@ function acquireMakeImagesLock(projectDir, pagePath) {
 		const ageSec = Math.round(age / 1000);
 		const remaining = Math.ceil((MAKE_IMAGES_LOCK_MS - age) / 60_000);
 		const target = pagePath
-			? `cette page (${relative(projectDir, pagePath)})`
-			: "ce projet";
-		throw new Error(
-			`⏳ make_images TOURNE DÉJÀ pour ${target} (démarrée il y a ${ageSec}s). NE LANCE PAS un 2e appel — ça facturerait les mêmes images en double. Attends la fin (verrou auto-libéré au plus tard dans ${remaining} min), puis relance : les images déjà branchées seront détectées et NON refacturées.`
-		);
+			? `this page (${relative(projectDir, pagePath)})`
+			: "this project";
+		// PAS d'erreur : une 1re génération tourne encore. On rend une réponse
+		// NORMALE (l'agent la lit comme un succès partiel, pas un plantage). Les
+		// images déjà branchées + les jetons par image évitent tout double-débit.
+		return {
+			busy: true,
+			message: `⏳ An image generation is already running for ${target} (started ${ageSec}s ago) — I will NOT start a 2nd one (that would bill the same images twice). It finishes on its own; rerun in ~${remaining} min: images already placed are skipped (0 extra credits), only the missing ones are made.`,
+		};
 	}
 	writeFileSync(lockPath, stamp);
-	return lockPath;
+	return { lockPath };
 }
 function releaseMakeImagesLock(lockPath) {
 	try {
 		unlinkSync(lockPath);
 	} catch {
 		// déjà supprimé ou non créé → rien à faire
+	}
+}
+
+// --- jeton par image (anti double-débit fin) -----------------------------------
+// Comble le trou : une image générée+payée mais pas encore branchée quand un
+// relancement rescanne la page. À la génération on écrit un jeton {fichier, alt,
+// dims} AVANT le branchement ; un relancement qui retrouve un jeton frais
+// RE-BRANCHE le fichier déjà sur disque (0 crédit) au lieu de régénérer.
+function slotSentinelPath(projectDir, slot) {
+	const key = createHash("sha1")
+		.update(`${slot.file}\n${slot.tag}`)
+		.digest("hex")
+		.slice(0, 16);
+	return join(projectDir, ".distribea-shots", "slots", `${key}.json`);
+}
+function readSlotSentinel(projectDir, slot) {
+	try {
+		const data = JSON.parse(
+			readFileSync(slotSentinelPath(projectDir, slot), "utf8")
+		);
+		if (Date.now() - (data.at ?? 0) < MAKE_IMAGES_LOCK_MS) {
+			return data;
+		}
+	} catch {
+		// pas de jeton (ou périmé) → génération normale
+	}
+	return null;
+}
+function writeSlotSentinel(projectDir, slot, data) {
+	try {
+		const p = slotSentinelPath(projectDir, slot);
+		mkdirSync(dirname(p), { recursive: true });
+		writeFileSync(p, JSON.stringify({ ...data, at: Date.now() }));
+	} catch {
+		// best-effort : sans jeton on perd juste le filet, pas la génération
+	}
+}
+function clearSlotSentinel(projectDir, slot) {
+	try {
+		unlinkSync(slotSentinelPath(projectDir, slot));
+	} catch {
+		// déjà absent → rien à faire
 	}
 }
 
@@ -833,7 +916,15 @@ async function runMakeImages(args, progress) {
 	const pagePath = pageMode
 		? resolveIn(projectDir, String(args.page_path))
 		: null;
-	const lockPath = acquireMakeImagesLock(projectDir, pagePath);
+	const lock = acquireMakeImagesLock(projectDir, pagePath);
+	if (lock.busy) {
+		// Réponse NORMALE (pas une erreur) : une 1re génération tourne encore.
+		return lock.message;
+	}
+	const { lockPath } = lock;
+	// Chrono démarré ICI (entrée réelle) : la capture avant/après ne tourne plus
+	// en barrage devant la génération, donc le budget temps est honnête.
+	const runStart = Date.now();
 	try {
 		const maxImages = Math.max(1, Math.min(20, Number(args.max_images ?? 10)));
 		const saveDir = args.save_dir
@@ -848,7 +939,7 @@ async function runMakeImages(args, progress) {
 				);
 		if (!allSlots.length) {
 			return pageMode
-				? `Aucun placeholder/stock trouvé sur ${relative(projectDir, pagePath)}. Écris d'abord des <img src="https://placehold.co/…"> aux emplacements voulus puis relance make_images — ou utilise generate_image pour un sujet libre.`
+				? `No placeholder/stock found on ${relative(projectDir, pagePath)}. First write <img src="https://placehold.co/…"> markers at the spots you want, then rerun make_images — or use generate_image for a free-form subject.`
 				: "No placeholder or stock images found — nothing to fill.";
 		}
 		const slots = allSlots.slice(0, maxImages);
@@ -884,9 +975,9 @@ async function runMakeImages(args, progress) {
 						`${i + 1}. ${relative(projectDir, s.file)} — ${s.src.slice(0, 70)} [${s.orientation}]${s.heading ? ` — section: "${s.heading}"` : ""}`
 				),
 				sharedCount
-					? `🤝 Avis répétés détectés : ${sharedCount} emplacement(s) partageront l'avatar d'un autre (0 crédit). Désactive avec share_avatars: false.`
+					? `🤝 Repeated reviews detected: ${sharedCount} slot(s) will share another's avatar (0 credits). Disable with share_avatars: false.`
 					: "",
-				`🧾 Devis : ${leaderSlots.length} image(s) à générer ≈ ${leaderSlots.length * IMAGE_CREDITS_HINT} crédits${sharedCount ? ` (+ ${sharedCount} branchée(s) en réutilisation, 0 crédit)` : ""}. Les avatars déjà connus du site ressortent aussi à 0 crédit.`,
+				`🧾 Estimate: ${leaderSlots.length} image(s) to generate ≈ ${leaderSlots.length * IMAGE_CREDITS_HINT} credits${sharedCount ? ` (+ ${sharedCount} reused slot(s), 0 credits)` : ""}. Avatars already known to the site also come out at 0 credits.`,
 				"Run again without dry_run to generate.",
 			]
 				.filter(Boolean)
@@ -898,42 +989,47 @@ async function runMakeImages(args, progress) {
 		const estimate = leaderSlots.length * IMAGE_CREDITS_HINT;
 		if (status.balance < estimate) {
 			throw new Error(
-				`🚫 Solde insuffisant pour ${leaderSlots.length} image(s) à générer (≈ ${estimate} crédits, solde: ${status.balance} crédits). Recharge sur ${APP_URL}/account/billing ou baisse max_images.`
+				`🚫 Not enough credits for ${leaderSlots.length} image(s) to generate (≈ ${estimate} credits, balance: ${status.balance} credits). Top up at ${APP_URL}/account/billing or lower max_images.`
 			);
 		}
 		// Devis annoncé AVANT de lancer — en crédits de l'abonnement, jamais en argent.
 		progress?.(
-			`🧾 Devis : ${leaderSlots.length} image(s) ≈ ${estimate} crédits${sharedCount ? ` (+ ${sharedCount} avatar(s) partagé(s) = 0 crédit)` : ""} — solde ${status.balance} crédits. Lancement…`,
+			`🧾 Estimate: ${leaderSlots.length} image(s) ≈ ${estimate} credits${sharedCount ? ` (+ ${sharedCount} shared avatar(s) = 0 credits)` : ""} — balance ${status.balance} credits. Starting…`,
 			0,
 			leaderSlots.length
 		);
 
 		// Révélation avant/après (si le projet de l'abonné a playwright+sharp).
-		let beforeShot = null;
+		// La capture AVANT tourne EN PARALLÈLE de la génération (plus en barrage
+		// devant elle) : elle ne vole plus de temps au budget. Le 1er branchement
+		// l'attend (racine de patchChain ci-dessous) pour que « AVANT » ne montre
+		// jamais un emplacement déjà rempli.
+		let beforeShotPromise = null;
 		if (pageMode) {
-			try {
-				beforeShot = await screenshotPage(
-					projectDir,
-					pagePath,
-					join(projectDir, ".distribea-shots", "before.png")
-				);
-			} catch (e) {
+			beforeShotPromise = screenshotPage(
+				projectDir,
+				pagePath,
+				join(projectDir, ".distribea-shots", "before.png")
+			).catch((e) => {
 				logErr(`screenshot avant impossible: ${e.message}`);
-			}
+				return null;
+			});
 		}
 
 		const excerpt = pagesExcerpt(projectDir);
 		// Branchement IMMÉDIAT par image (écritures fichier sérialisées, générations
 		// parallèles) : si la connexion coupe au milieu du lot, les images déjà
 		// payées sont DÉJÀ dans le code → relancer ne refait que ce qui manque.
-		let patchChain = Promise.resolve();
+		// Le 1er branchement attend la capture AVANT (sinon elle photographierait
+		// un emplacement déjà rempli) — sans bloquer le démarrage des générations.
+		let patchChain = beforeShotPromise
+			? beforeShotPromise.then(() => {})
+			: Promise.resolve();
 		const patchOne = (r) => {
 			const job = patchChain.then(async () => {
 				const current = readFileSync(r.slot.file, "utf8");
 				if (!current.includes(r.slot.tag)) {
-					throw new Error(
-						"emplacement introuvable (fichier modifié pendant la génération)"
-					);
+					throw new Error("slot not found (file changed during generation)");
 				}
 				await writeFile(
 					r.slot.file,
@@ -959,20 +1055,47 @@ async function runMakeImages(args, progress) {
 		// sont gardés pour la prochaine relance — l'utilisateur reçoit une
 		// réponse normale "X/N branchées, relance pour le reste" au lieu d'une
 		// erreur (cf incident 2026-06-14 > 4 min 40).
-		const softDeadline = Date.now() + MAKE_IMAGES_SOFT_DEADLINE_MS;
+		const softDeadline = runStart + MAKE_IMAGES_SOFT_DEADLINE_MS;
 		const skipped = [];
 		const settled = await mapPool(leaderSlots, 3, async (slot, idx) => {
 			if (Date.now() > softDeadline) {
 				skipped.push(slot);
 				doneCount += 1;
 				progress?.(
-					`⏸ ${doneCount}/${leaderSlots.length} — ${relative(projectDir, slot.file)} (sautée, à relancer)`,
+					`⏸ ${doneCount}/${leaderSlots.length} — ${relative(projectDir, slot.file)} (skipped, rerun to finish)`,
 					doneCount,
 					leaderSlots.length
 				);
 				return null;
 			}
 			try {
+				// Filet anti double-débit : un relancement qui retrouve un jeton
+				// frais re-branche le fichier déjà payé+téléchargé (0 crédit) au
+				// lieu de régénérer l'image.
+				const sentinel = readSlotSentinel(projectDir, slot);
+				if (sentinel) {
+					const reused = {
+						slot,
+						fileName: sentinel.fileName,
+						outPath: join(saveDir, sentinel.fileName),
+						alt: sentinel.alt,
+						dims: sentinel.dims,
+						reused: true,
+						reviewer: sentinel.reviewer ?? null,
+						character: sentinel.character ?? null,
+						credits: 0,
+						styleInferred: false,
+					};
+					await patchOne(reused);
+					clearSlotSentinel(projectDir, slot);
+					doneCount += 1;
+					progress?.(
+						`♻ ${doneCount}/${leaderSlots.length} — ${reused.fileName} re-wired (0 credits)`,
+						doneCount,
+						leaderSlots.length
+					);
+					return reused;
+				}
 				const r = await generateSlotImage(
 					projectDir,
 					slot,
@@ -980,10 +1103,20 @@ async function runMakeImages(args, progress) {
 					`${slugify(slot.heading || slot.alt || "image")}-${String(idx + 1).padStart(2, "0")}`,
 					excerpt
 				);
+				// Jeton écrit AVANT le branchement : si la connexion coupe ici, un
+				// relancement re-branchera ce fichier sans le re-payer.
+				writeSlotSentinel(projectDir, slot, {
+					fileName: r.fileName,
+					alt: r.alt,
+					dims: r.dims,
+					reviewer: r.reviewer,
+					character: r.character,
+				});
 				await patchOne(r);
+				clearSlotSentinel(projectDir, slot);
 				doneCount += 1;
 				progress?.(
-					`✔ ${doneCount}/${leaderSlots.length} — ${r.fileName} branchée`,
+					`✔ ${doneCount}/${leaderSlots.length} — ${r.fileName} wired in`,
 					doneCount,
 					leaderSlots.length
 				);
@@ -1002,7 +1135,7 @@ async function runMakeImages(args, progress) {
 		const results = settled.filter(Boolean);
 		if (!(results.length || skipped.length)) {
 			throw new Error(
-				`Aucune image générée — ${failures[0]?.message ?? "erreur inconnue"}. Relance make_images : rien n'a été débité en double.`
+				`No image generated — ${failures[0]?.message ?? "unknown error"}. Rerun make_images: nothing was double-charged.`
 			);
 		}
 
@@ -1015,8 +1148,7 @@ async function runMakeImages(args, progress) {
 			if (!leader) {
 				failures.push({
 					slot,
-					message:
-						"avatar partagé indisponible (génération du leader a échoué)",
+					message: "shared avatar unavailable (leader generation failed)",
 				});
 				continue;
 			}
@@ -1041,26 +1173,33 @@ async function runMakeImages(args, progress) {
 		}
 
 		const images = [];
-		if (pageMode && beforeShot) {
+		// Capture APRÈS + montage : purement cosmétique. On la SAUTE si on est
+		// trop près du watchdog (sinon le montage pourrait pousser l'appel au-delà
+		// de la coupure). La capture AVANT, lancée en parallèle, est récupérée ici.
+		const revealBudgetOk = Date.now() - runStart < TOOL_TIMEOUT_MS - 45_000;
+		if (pageMode && beforeShotPromise && revealBudgetOk) {
 			try {
-				const afterShot = await screenshotPage(
-					projectDir,
-					pagePath,
-					join(projectDir, ".distribea-shots", "after.png")
-				);
-				if (afterShot) {
-					const reveal = await compositeBeforeAfter(
+				const beforeShot = await beforeShotPromise;
+				if (beforeShot) {
+					const afterShot = await screenshotPage(
 						projectDir,
-						beforeShot,
-						afterShot,
-						join(
-							projectDir,
-							".distribea-shots",
-							`avant-apres-${Date.now()}.jpg`
-						)
+						pagePath,
+						join(projectDir, ".distribea-shots", "after.png")
 					);
-					if (reveal) {
-						images.push(reveal);
+					if (afterShot) {
+						const reveal = await compositeBeforeAfter(
+							projectDir,
+							beforeShot,
+							afterShot,
+							join(
+								projectDir,
+								".distribea-shots",
+								`avant-apres-${Date.now()}.jpg`
+							)
+						);
+						if (reveal) {
+							images.push(reveal);
+						}
 					}
 				}
 			} catch (e) {
@@ -1070,30 +1209,30 @@ async function runMakeImages(args, progress) {
 
 		const billed = results.filter((r) => !r.reused).length;
 		const sharedNote = sharedCount
-			? ` — dont ${sharedCount} avis partagé(s) (0 crédit)`
+			? ` — including ${sharedCount} shared review(s) (0 credits)`
 			: "";
 		return {
 			text: [
 				results.some((r) => r.styleInferred) ? STYLE_INFERRED_NOTE : "",
-				`${pageMode ? `Page habillée ${failures.length ? "(partiellement)" : "✔"} — ${results.length} emplacement(s) branché(s) dans ${relative(projectDir, pagePath)}` : `Filled ${results.length}/${allSlots.length} placeholder/stock slot(s) ${failures.length ? "(partiel)" : "✔"}`} (${billed} image(s) facturée(s)${sharedNote})`,
+				`${pageMode ? `Page dressed ${failures.length ? "(partially)" : "✔"} — ${results.length} slot(s) wired in ${relative(projectDir, pagePath)}` : `Filled ${results.length}/${allSlots.length} placeholder/stock slot(s) ${failures.length ? "(partial)" : "✔"}`} (${billed} image(s) billed${sharedNote})`,
 				...results.map((r) => describeResult(projectDir, r)),
 				failures.length
 					? [
-							`⚠ ${failures.length} image(s) non générées :`,
+							`⚠ ${failures.length} image(s) not generated:`,
 							...failures.map(
 								(f) =>
 									`  ✗ ${relative(projectDir, f.slot.file)}${f.slot.heading ? ` ("${f.slot.heading}")` : ""} — ${f.message}`
 							),
-							"→ Relance make_images : les images déjà branchées ne sont PAS refaites (0 crédit en plus), seuls les emplacements restants seront générés.",
+							"→ Rerun make_images: images already wired in are NOT redone (0 extra credits), only the remaining slots are generated.",
 						].join("\n")
 					: "",
 				skipped.length
-					? `⏸ ${skipped.length} image(s) sautée(s) pour rester sous le budget temps (4 min 10) — RELANCE le même appel : les déjà-branchées seront ignorées, seules les restantes seront générées (0 crédit en double).`
+					? `⏸ ${skipped.length} image(s) skipped to stay within the time budget (4 min 10) — RERUN the same call: the already-wired ones are skipped, only the remaining ones are generated (0 double-charge).`
 					: "",
 				allSlots.length > slots.length
 					? `⚠ ${allSlots.length - slots.length} slot(s) left unfilled (max_images) — run again to continue.`
 					: "",
-				images.length ? "Révélation avant/après ci-dessous 👇" : "",
+				images.length ? "Before/after reveal below 👇" : "",
 			]
 				.filter(Boolean)
 				.join("\n"),
@@ -1109,11 +1248,7 @@ async function runGenerateImage(args, progress) {
 	if (!subject) {
 		throw new Error("subject is required");
 	}
-	progress?.(
-		`🎨 Génération en cours (≈ ${IMAGE_CREDITS_HINT} crédits, 30-60 s)…`,
-		0,
-		1
-	);
+	progress?.(`🎨 Generating (≈ ${IMAGE_CREDITS_HINT} credits, 30-60 s)…`, 0, 1);
 	const projectDir = resolveIn(
 		process.cwd(),
 		args.project_dir ?? process.cwd()
@@ -1146,13 +1281,13 @@ async function runGenerateImage(args, progress) {
 		await saveUrl(out.image.cdn_url, outPath);
 		return [
 			out.reused
-				? `Avatar UGC réutilisé ✔ (même client "${out.reviewer}" = même visage — 0 crédit)`
-				: `Avatar UGC generated ✔ (${out.credits} crédits)`,
+				? `UGC avatar reused ✔ (same customer "${out.reviewer}" = same face — 0 credits)`
+				: `UGC avatar generated ✔ (${out.credits} credits)`,
 			`file: ${outPath}`,
 			`size: ${out.image.width}×${out.image.height} (optimised WebP)`,
 			`alt: ${out.alt}`,
 			out.reviewer
-				? `client: ${out.reviewer} — son visage restera IDENTIQUE sur ce site (et ne sera JAMAIS réutilisé sur un autre)`
+				? `customer: ${out.reviewer} — their face will stay IDENTICAL on this site (and will NEVER be reused on another)`
 				: "",
 			"",
 			"Ready-to-paste:",
@@ -1176,7 +1311,7 @@ async function runGenerateImage(args, progress) {
 	await saveUrl(out.image.cdn_url, outPath);
 	return [
 		out.style_inferred ? STYLE_INFERRED_NOTE : "",
-		`Image generated ✔ (${out.credits} crédits)`,
+		`Image generated ✔ (${out.credits} credits)`,
 		`file: ${outPath}`,
 		`size: ${out.image.width}×${out.image.height} — ${Math.round(out.image.bytes / 1024)} KB (optimised WebP)`,
 		`alt: ${out.alt}`,
@@ -1201,14 +1336,14 @@ async function resolveArticle(projectDir, args) {
 		try {
 			raw = await readFile(p, "utf8");
 		} catch (e) {
-			throw new Error(`Article introuvable : ${p} (${e.message})`);
+			throw new Error(`Article not found: ${p} (${e.message})`);
 		}
 		return { title: "", text: stripMarkup(raw).slice(0, 8000) };
 	}
 	if (args.article_url) {
 		const u = String(args.article_url).trim();
 		if (!/^https?:\/\//i.test(u)) {
-			throw new Error("article_url doit commencer par http:// ou https://");
+			throw new Error("article_url must start with http:// or https://");
 		}
 		let res;
 		try {
@@ -1218,12 +1353,10 @@ async function resolveArticle(projectDir, args) {
 				redirect: "follow",
 			});
 		} catch (e) {
-			throw new Error(`Lecture de l'article impossible (${u}) : ${e.message}`);
+			throw new Error(`Could not read the article (${u}): ${e.message}`);
 		}
 		if (!res.ok) {
-			throw new Error(
-				`Lecture de l'article impossible (HTTP ${res.status}) — ${u}`
-			);
+			throw new Error(`Could not read the article (HTTP ${res.status}) — ${u}`);
 		}
 		const html = await res.text();
 		const title = oneLine(
@@ -1248,7 +1381,7 @@ async function runBlogCover(args, progress) {
 	const text = resolved.text;
 	if (!(title || text)) {
 		throw new Error(
-			"Donne l'article : article_text (texte collé), article_url (lien public) ou article_file (fichier local)."
+			"Provide the article: article_text (pasted text), article_url (public link) or article_file (local file)."
 		);
 	}
 	const extra = Math.max(
@@ -1267,7 +1400,7 @@ async function runBlogCover(args, progress) {
 		: join(projectDir, "public", "images");
 
 	progress?.(
-		`🎨 Cover de blog (${count} image${count > 1 ? "s" : ""}, ≈ ${IMAGE_CREDITS_HINT * count} crédits, 30-60 s)…`,
+		`🎨 Blog cover (${count} image${count > 1 ? "s" : ""}, ≈ ${IMAGE_CREDITS_HINT * count} credits, 30-60 s)…`,
 		0,
 		1
 	);
@@ -1297,7 +1430,7 @@ async function runBlogCover(args, progress) {
 
 	const lines = [
 		out.style_inferred ? STYLE_INFERRED_NOTE : "",
-		`Cover de blog générée ✔ (${out.credits} crédits)`,
+		`Blog cover generated ✔ (${out.credits} credits)`,
 	];
 	for (const im of saved) {
 		lines.push(
@@ -1329,10 +1462,10 @@ async function runEditImage(args, progress) {
 		!["edit", "redo", "remove_background", "upscale", "extend"].includes(action)
 	) {
 		throw new Error(
-			"Donne une instruction (quoi changer) ou une action: redo, remove_background, upscale, extend."
+			"Provide an instruction (what to change) or an action: redo, remove_background, upscale, extend."
 		);
 	}
-	progress?.("🎨 Retouche en cours (30-60 s)…", 0, 1);
+	progress?.("🎨 Retouching (30-60 s)…", 0, 1);
 	const src = resolveIn(projectDir, args.image_path);
 	const srcExt = extname(src).toLowerCase();
 	const out = await engine("edit_image", projectDir, {
@@ -1363,13 +1496,13 @@ async function runEditImage(args, progress) {
 	}
 	await saveUrl(out.image.cdn_url, outPath);
 	const label = {
-		edit: "Retouche faite",
-		redo: `Refaite ✔ avec ta consigne ("${args.instruction}") — remplacée AU MÊME ENDROIT, le code n'a pas bougé`,
-		remove_background: "Fond supprimé",
-		upscale: "Agrandie ×4",
-		extend: `Élargie en ${args.aspect_ratio ?? "21:9"}`,
+		edit: "Retouch done",
+		redo: `Redone ✔ with your instruction ("${args.instruction}") — replaced IN PLACE, the code did not move`,
+		remove_background: "Background removed",
+		upscale: "Upscaled ×4",
+		extend: `Widened to ${args.aspect_ratio ?? "21:9"}`,
 	}[action];
-	return `${label} ✔ (${out.credits} crédits)\nfile: ${outPath} (${out.image.width}×${out.image.height}, ${Math.round(out.image.bytes / 1024)} KB)`;
+	return `${label} ✔ (${out.credits} credits)\nfile: ${outPath} (${out.image.width}×${out.image.height}, ${Math.round(out.image.bytes / 1024)} KB)`;
 }
 
 async function runSiteStyle(args, progress) {
@@ -1381,11 +1514,7 @@ async function runSiteStyle(args, progress) {
 		args.action ??
 		(args.image_path ? "lock_image" : args.feedback ? "refine" : "setup");
 	if (action === "setup" && args.moodboard === true) {
-		progress?.(
-			`🎨 Style + moodboard en cours (≈ ${IMAGE_CREDITS_HINT} crédits)…`,
-			0,
-			1
-		);
+		progress?.(`🎨 Style + moodboard (≈ ${IMAGE_CREDITS_HINT} credits)…`, 0, 1);
 	}
 
 	if (action === "lock_image") {
@@ -1393,9 +1522,9 @@ async function runSiteStyle(args, progress) {
 			image: await imageArgToDataUri(projectDir, args.image_path),
 		});
 		return [
-			"Style ANCRÉ sur ton image ✔ — chaque nouvelle image recevra cette référence et répliquera exactement sa technique (0 crédit de génération).",
+			"Style ANCHORED to your image ✔ — every new image will receive this reference and replicate its technique exactly (0 generation credits).",
 			`medium: ${out.style.medium} | palette: ${out.style.palette.join(", ")}`,
-			"Toutes les commandes (make_images, generate_image…) l'utilisent désormais automatiquement.",
+			"Every command (make_images, generate_image…) now uses it automatically.",
 		].join("\n");
 	}
 
@@ -1405,7 +1534,7 @@ async function runSiteStyle(args, progress) {
 			pages_excerpt: pagesExcerpt(projectDir),
 		});
 		return [
-			`Style ajusté ✔ — "${args.feedback}" est maintenant GRAVÉ dans la bible (toutes les futures images en tiennent compte).`,
+			`Style adjusted ✔ — "${args.feedback}" is now ENGRAVED in the bible (every future image takes it into account).`,
 			`palette: ${out.style.palette.join(", ")}`,
 			`lighting: ${out.style.lighting}`,
 			`mood: ${out.style.mood} | medium: ${out.style.medium}`,
@@ -1420,21 +1549,21 @@ async function runSiteStyle(args, progress) {
 	});
 	if (out.questions) {
 		return [
-			"Le brief est un peu court — 2-3 réponses et le style sera parfait :",
+			"The brief is a bit short — 2-3 answers and the style will be perfect:",
 			...out.questions.map((q, i) => `${i + 1}. ${q}`),
-			"Relance site_style avec le brief enrichi des réponses (ou force: true pour me laisser deviner).",
+			"Rerun site_style with the brief enriched with your answers (or force: true to let me guess).",
 		].join("\n");
 	}
 	const images = [];
 	let moodNote =
-		"Envie de VOIR le style avant de générer ? relance avec moodboard: true (1 image facturée).";
+		"Want to SEE the style before generating? rerun with moodboard: true (1 image billed).";
 	if (out.moodboard?.cdn_url) {
 		const boardPath = join(projectDir, ".distribea-shots", "moodboard.jpg");
 		await saveUrl(out.moodboard.cdn_url, boardPath);
 		images.push(boardPath);
-		moodNote = `Moodboard ci-dessous. Pas convaincu ? site_style (refine: "plus chaleureux") l'ajuste.`;
+		moodNote = `Moodboard below. Not convinced? site_style (refine: "warmer") adjusts it.`;
 	} else if (out.moodboard_error) {
-		moodNote = `(moodboard non généré: ${out.moodboard_error})`;
+		moodNote = `(moodboard not generated: ${out.moodboard_error})`;
 	}
 	return {
 		text: [
@@ -1473,8 +1602,8 @@ async function runCreateReference(args) {
 			`name: ${out.name}`,
 			`look: ${out.description}`,
 			args.kind === "place"
-				? `Ce LIEU sera reconstruit À L'IDENTIQUE dans toutes les images qui le citent (param product: "${out.name}", ou automatiquement quand son nom apparaît près d'un placeholder).`
-				: `Cet objet restera IDENTIQUE dans toutes les images qui le citent (param product: "${out.name}", ou automatiquement quand son nom apparaît près d'un placeholder).`,
+				? `This PLACE will be rebuilt IDENTICALLY in every image that references it (pass product: "${out.name}", or automatically when its name appears near a placeholder).`
+				: `This object will stay IDENTICAL in every image that references it (pass product: "${out.name}", or automatically when its name appears near a placeholder).`,
 		].join("\n");
 	}
 	const out = await engine("create_character", projectDir, {
@@ -1495,7 +1624,7 @@ async function runBrandPack(args, progress) {
 	const action = args.action ?? "all";
 	if (!["all", "logo", "favicons", "social_image"].includes(action)) {
 		throw new Error(
-			`Action inconnue "${action}" — actions disponibles : all | logo | favicons | social_image. (La création de pictogrammes a été retirée.)`
+			`Unknown action "${action}" — available actions: all | logo | favicons | social_image. (Pictogram creation has been removed.)`
 		);
 	}
 	const projectDir = resolveIn(
@@ -1525,9 +1654,9 @@ async function runBrandPack(args, progress) {
 		}
 		texts.push(
 			[
-				`Logo créé ✔ avec le spécialiste typo (${out.credits} crédits)`,
-				`fichiers: ${logoPath} (transparent) + ${whitePath} (fond blanc)`,
-				"Le favicon en dérivera automatiquement (brand_pack action favicons).",
+				`Logo created ✔ with the typography specialist (${out.credits} credits)`,
+				`files: ${logoPath} (transparent) + ${whitePath} (white background)`,
+				"The favicon will derive from it automatically (brand_pack action favicons).",
 			].join("\n")
 		);
 	};
@@ -1546,16 +1675,16 @@ async function runBrandPack(args, progress) {
 		}
 		const creditNote =
 			out.derived_from === "logo"
-				? "0 crédit (dérivé du logo de la marque)"
+				? "0 credits (derived from the brand logo)"
 				: out.derived_from === "source"
-					? "0 crédit (dérivé du fichier fourni)"
-					: `${out.credits} crédits (icône générée)`;
+					? "0 credits (derived from the provided file)"
+					: `${out.credits} credits (icon generated)`;
 		texts.push(
 			[
-				`Pack d'icônes généré ✔ (${creditNote}) → ${outDir}`,
+				`Icon pack generated ✔ (${creditNote}) → ${outDir}`,
 				"favicon.ico (16/32/48) · apple-touch-icon.png · icon-192.png · icon-512.png · site.webmanifest",
 				"",
-				"Balises:",
+				"Tags:",
 				`<link rel="icon" href="/favicon.ico" sizes="48x48" />`,
 				`<link rel="apple-touch-icon" href="/apple-touch-icon.png" />`,
 				`<link rel="manifest" href="/site.webmanifest" />`,
@@ -1576,7 +1705,7 @@ async function runBrandPack(args, progress) {
 		const publicPath = `/images/og/${file}`;
 		texts.push(
 			[
-				`Social image generated ✔ (${out.credits} crédits)`,
+				`Social image generated ✔ (${out.credits} credits)`,
 				`file: ${saveTo} (${out.image.width}×${out.image.height}, ${Math.round(out.image.bytes / 1024)} KB)`,
 				`alt: ${out.alt}`,
 				"",
@@ -1591,36 +1720,36 @@ async function runBrandPack(args, progress) {
 	};
 
 	if (action === "logo") {
-		progress?.("🖋 Logo en cours (spécialiste typo)…", 0, 1);
+		progress?.("🖋 Logo in progress (typography specialist)…", 0, 1);
 		await doLogo();
 	} else if (action === "favicons") {
-		progress?.("🧩 Pack d'icônes en cours…", 0, 1);
+		progress?.("🧩 Icon pack in progress…", 0, 1);
 		await doFavicons();
 	} else if (action === "social_image") {
 		const title = String(args.title ?? "").trim();
 		if (!title) {
 			throw new Error("title is required");
 		}
-		progress?.("🖼 Image de partage en cours…", 0, 1);
+		progress?.("🖼 Social image in progress…", 0, 1);
 		await doSocial(title);
 	} else {
 		// "all" — logo (si absent) → favicons → og:image (titre = nom de marque).
 		const status = await engine("status", projectDir, {});
 		let step = 0;
 		if (!status.style?.has_logo) {
-			progress?.("🖋 1/3 Logo en cours (spécialiste typo)…", step, 3);
+			progress?.("🖋 1/3 Logo in progress (typography specialist)…", step, 3);
 			await doLogo();
 			step += 1;
 		}
-		progress?.(`🧩 ${step + 1}/3 Pack d'icônes en cours…`, step, 3);
+		progress?.(`🧩 ${step + 1}/3 Icon pack in progress…`, step, 3);
 		await doFavicons();
 		step += 1;
 		const title = String(args.title ?? status.style?.brand_name ?? "").trim();
 		if (title) {
-			progress?.(`🖼 ${step + 1}/3 Image de partage en cours…`, step, 3);
+			progress?.(`🖼 ${step + 1}/3 Social image in progress…`, step, 3);
 			await doSocial(title);
 		} else {
-			texts.push("og:image sautée — donne un title pour l'image de partage.");
+			texts.push("og:image skipped — provide a title for the social image.");
 		}
 	}
 	return { text: texts.join("\n\n———\n\n"), images };
@@ -1652,17 +1781,17 @@ async function runFinishImages(args, progress) {
 			const rel = relative(projectDir, file);
 			const local = resolveImageRef(projectDir, file, src);
 			if (local === "missing") {
-				issues.push(`✗ LIEN CASSÉ — ${rel} → ${src}`);
+				issues.push(`✗ BROKEN LINK — ${rel} → ${src}`);
 				continue;
 			}
 			if (PLACEHOLDER_SRC_RE.test(src)) {
 				issues.push(
-					`✗ PLACEHOLDER/STOCK restant — ${rel} → ${src.slice(0, 60)} (make_images le règle)`
+					`✗ PLACEHOLDER/STOCK left — ${rel} → ${src.slice(0, 60)} (make_images fixes it)`
 				);
 			}
 			if (local && statSync(local).size > 300_000) {
 				issues.push(
-					`✗ LOURD (${Math.round(statSync(local).size / 1024)} KB) — ${src.slice(0, 60)} (la passe WebP ci-dessous le règle)`
+					`✗ HEAVY (${Math.round(statSync(local).size / 1024)} KB) — ${src.slice(0, 60)} (the WebP pass below fixes it)`
 				);
 			}
 			if (!altM?.[2]?.trim()) {
@@ -1674,7 +1803,7 @@ async function runFinishImages(args, progress) {
 					fixable.push({ file, tag, local, rel, src });
 				} else {
 					issues.push(
-						`✗ ALT manquant (image distante) — ${rel} → ${src.slice(0, 60)}`
+						`✗ ALT missing (remote image) — ${rel} → ${src.slice(0, 60)}`
 					);
 				}
 			}
@@ -1702,7 +1831,7 @@ async function runFinishImages(args, progress) {
 				}));
 			} catch (e) {
 				issues.push(
-					`✗ ALT non écrit (réessaie plus tard) — ${f.rel} (${e.message})`
+					`✗ ALT not written (try again later) — ${f.rel} (${e.message})`
 				);
 				continue;
 			}
@@ -1722,14 +1851,14 @@ async function runFinishImages(args, progress) {
 			}
 			const cur = byFile.get(f.file) ?? readFileSync(f.file, "utf8");
 			byFile.set(f.file, cur.replace(f.tag, newTag));
-			fixedLines.push(`✔ ALT écrit — ${f.rel} → "${alt}"`);
+			fixedLines.push(`✔ ALT written — ${f.rel} → "${alt}"`);
 		}
 		for (const [file, content] of byFile) {
 			await writeFile(file, content);
 		}
 	} else if (fixable.length) {
 		for (const f of fixable) {
-			issues.push(`✗ ALT manquant — ${f.rel} → ${f.src.slice(0, 60)}`);
+			issues.push(`✗ ALT missing — ${f.rel} → ${f.src.slice(0, 60)}`);
 		}
 	}
 
@@ -1765,7 +1894,7 @@ async function runFinishImages(args, progress) {
 			});
 		} catch (e) {
 			issues.push(
-				`✗ WebP raté — ${relative(projectDir, f.path)} (${e.message})`
+				`✗ WebP failed — ${relative(projectDir, f.path)} (${e.message})`
 			);
 		}
 	}
@@ -1787,27 +1916,27 @@ async function runFinishImages(args, progress) {
 	const totalSaved = converted.reduce((s, c) => s + c.savedKb, 0);
 	const clean = !(issues.length || fixedLines.length);
 	return [
-		`Audit images — ${relative(process.cwd(), projectDir) || projectDir}`,
+		`Image audit — ${relative(process.cwd(), projectDir) || projectDir}`,
 		clean
-			? "✅ Rien à signaler : alts complets, pas de lien cassé, pas de placeholder, poids OK."
+			? "✅ Nothing to report: alts complete, no broken links, no placeholders, sizes OK."
 			: "",
 		...fixedLines,
 		...issues,
 		fixable.length > maxFix
-			? `… ${fixable.length - maxFix} alt(s) restants (max_fix)`
+			? `… ${fixable.length - maxFix} alt(s) remaining (max_fix)`
 			: "",
 		"",
 		"———",
 		converted.length
 			? [
-					`Optimisation ✔ — ${converted.length} image(s) converties en WebP, ${totalSaved} KB gagnés, ${refSwaps} référence(s) mises à jour dans le code (0 crédit).`,
+					`Optimisation ✔ — ${converted.length} image(s) converted to WebP, ${totalSaved} KB saved, ${refSwaps} reference(s) updated in the code (0 credits).`,
 					...converted.map(
 						(c) =>
 							`• ${relative(projectDir, c.from)} → ${c.toName} (-${c.savedKb} KB)`
 					),
-					"Les originaux JPG/PNG sont conservés à côté (filet de sécurité) — supprime-les quand tu es satisfait.",
+					"The original JPG/PNG files are kept alongside (safety net) — delete them once you're happy.",
 				].join("\n")
-			: "Rien à optimiser — aucune image JPG/PNG lourde trouvée.",
+			: "Nothing to optimise — no heavy JPG/PNG images found.",
 	]
 		.filter(Boolean)
 		.join("\n");
@@ -1837,7 +1966,7 @@ async function runPackStatus(args) {
 	);
 	if (s.avatars.length) {
 		lines.push(
-			`avatars UGC (avis clients, propres à CE site): ${s.avatars.join(", ")}`
+			`UGC avatars (customer reviews, specific to THIS site): ${s.avatars.join(", ")}`
 		);
 	}
 	lines.push(`images generated: ${s.images_count}`);
@@ -1998,35 +2127,35 @@ async function runRebrandImages(args, progress) {
 
 	const notes = [
 		eligibleBeyondCap
-			? `+${eligibleBeyondCap} autre(s) image(s) au-delà de la limite (max_images=${max}) — monte max_images (jusqu'à 20) ou relance pour continuer.`
+			? `+${eligibleBeyondCap} more image(s) beyond the limit (max_images=${max}) — raise max_images (up to 20) or rerun to continue.`
 			: "",
 		placeholders
-			? `${placeholders} placeholder(s)/stock détecté(s) aussi → make_images (sans rebrand) s'en charge.`
+			? `${placeholders} placeholder(s)/stock detected too → make_images (without rebrand) handles those.`
 			: "",
-		tiny ? `${tiny} petite(s) image(s) (pictos) ignorée(s).` : "",
+		tiny ? `${tiny} small image(s) (pictograms) skipped.` : "",
 		alreadyDone
-			? `${alreadyDone} image(s) déjà rebrandée(s) lors d'un passage précédent — laissées telles quelles, 0 crédit (supprime le fichier *.original correspondant pour en refaire une).`
+			? `${alreadyDone} image(s) already rebranded in a previous run — left as-is, 0 credits (delete the matching *.original file to redo one).`
 			: "",
 	].filter(Boolean);
 
 	if (!candidates.length) {
 		return [
 			alreadyDone
-				? "Rien de nouveau à rebrander — tout a déjà été fait."
-				: "Aucune vraie image à rebrander trouvée dans le code.",
+				? "Nothing new to rebrand — everything is already done."
+				: "No real image to rebrand found in the code.",
 			...notes,
 		].join("\n");
 	}
 	if (!args.apply) {
 		return [
-			`${candidates.length} image(s) existantes prêtes à être rebrandées (proposition — rien n'a été touché, 0 crédit) :`,
+			`${candidates.length} existing image(s) ready to be rebranded (proposal — nothing was touched, 0 credits):`,
 			...candidates.map(
 				(c) =>
 					`• ${relative(projectDir, c.path)} (${c.width || "?"}×${c.height || "?"}, ${Math.round(c.bytes / 1024)} KB) — ${[...c.usedIn].join(", ")}${c.heading ? ` — section "${c.heading}"` : ""}`
 			),
 			"",
-			`🧾 Devis : ${candidates.length} image(s) ≈ ${candidates.length * IMAGE_CREDITS_HINT} crédits de ton abonnement.`,
-			`→ Relance make_images avec rebrand: true et apply: true pour TOUT refaire d'un coup dans le style du site. Chaque fichier est remplacé AU MÊME ENDROIT (le code ne bouge pas), original gardé à côté en *.original.`,
+			`🧾 Estimate: ${candidates.length} image(s) ≈ ${candidates.length * IMAGE_CREDITS_HINT} credits from your subscription.`,
+			`→ Rerun make_images with rebrand: true and apply: true to redo them ALL at once in the site's style. Each file is replaced IN PLACE (the code does not move), the original kept alongside as *.original.`,
 			...notes,
 		].join("\n");
 	}
@@ -2036,11 +2165,11 @@ async function runRebrandImages(args, progress) {
 	const estimate = candidates.length * IMAGE_CREDITS_HINT;
 	if (status.balance < estimate) {
 		throw new Error(
-			`🚫 Solde insuffisant pour rebrander ${candidates.length} image(s) (≈ ${estimate} crédits, solde: ${status.balance} crédits). Recharge sur ${APP_URL}/account/billing ou baisse max_images.`
+			`🚫 Not enough credits to rebrand ${candidates.length} image(s) (≈ ${estimate} credits, balance: ${status.balance} credits). Top up at ${APP_URL}/account/billing or lower max_images.`
 		);
 	}
 	progress?.(
-		`🧾 Devis : ${candidates.length} image(s) à rebrander ≈ ${estimate} crédits — solde ${status.balance} crédits. Lancement…`,
+		`🧾 Estimate: ${candidates.length} image(s) to rebrand ≈ ${estimate} credits — balance ${status.balance} credits. Starting…`,
 		0,
 		candidates.length
 	);
@@ -2056,7 +2185,7 @@ async function runRebrandImages(args, progress) {
 			skipped.push(c);
 			doneCount += 1;
 			progress?.(
-				`⏸ ${doneCount}/${candidates.length} — ${relative(projectDir, c.path)} (sautée, à relancer)`,
+				`⏸ ${doneCount}/${candidates.length} — ${relative(projectDir, c.path)} (skipped, rerun to finish)`,
 				doneCount,
 				candidates.length
 			);
@@ -2081,7 +2210,7 @@ async function runRebrandImages(args, progress) {
 			await saveUrl(out.image.cdn_url, c.path);
 			doneCount += 1;
 			progress?.(
-				`✔ ${doneCount}/${candidates.length} — ${relative(projectDir, c.path)} rebrandée`,
+				`✔ ${doneCount}/${candidates.length} — ${relative(projectDir, c.path)} rebranded`,
 				doneCount,
 				candidates.length
 			);
@@ -2100,28 +2229,28 @@ async function runRebrandImages(args, progress) {
 	const results = settled.filter(Boolean);
 	if (!(results.length || skipped.length)) {
 		throw new Error(
-			`Aucune image rebrandée — ${failures[0]?.message ?? "erreur inconnue"}. Relance le même appel : ce qui a déjà été fait n'est jamais refacturé.`
+			`No image rebranded — ${failures[0]?.message ?? "unknown error"}. Rerun the same call: what's already done is never re-charged.`
 		);
 	}
 
 	return [
 		results.some((r) => r.styleInferred) ? STYLE_INFERRED_NOTE : "",
-		`Rebranding ${failures.length ? "(partiel)" : "✔"} — ${results.length} image(s) refaites dans le style du site et remplacées AU MÊME ENDROIT, le code n'a pas bougé (${results.length} image(s) facturée(s))`,
+		`Rebranding ${failures.length ? "(partial)" : "✔"} — ${results.length} image(s) redone in the site's style and replaced IN PLACE, the code did not move (${results.length} image(s) billed)`,
 		...results.map(
 			(r) =>
-				`• ${relative(projectDir, r.c.path)} (${r.dims.width}×${r.dims.height}, ${Math.round(r.dims.bytes / 1024)} KB) — original gardé en .original`
+				`• ${relative(projectDir, r.c.path)} (${r.dims.width}×${r.dims.height}, ${Math.round(r.dims.bytes / 1024)} KB) — original kept as .original`
 		),
 		failures.length
 			? [
-					`⚠ ${failures.length} image(s) non rebrandées :`,
+					`⚠ ${failures.length} image(s) not rebranded:`,
 					...failures.map(
 						(f) => `  ✗ ${relative(projectDir, f.c.path)} — ${f.message}`
 					),
-					"→ Relance le même appel (rebrand: true, apply: true) : les images déjà faites sont automatiquement sautées, 0 crédit en double.",
+					"→ Rerun the same call (rebrand: true, apply: true): images already done are skipped automatically, 0 double-charge.",
 				].join("\n")
 			: "",
 		skipped.length
-			? `⏸ ${skipped.length} image(s) sautée(s) pour rester sous le budget temps (4 min 10) — RELANCE le même appel : les déjà-rebrandées sont automatiquement sautées (0 crédit en double).`
+			? `⏸ ${skipped.length} image(s) skipped to stay within the time budget (4 min 10) — RERUN the same call: the already-rebranded ones are skipped automatically (0 double-charge).`
 			: "",
 		...notes,
 	]
@@ -2169,7 +2298,8 @@ const TOOLS = [
 				},
 				max_images: {
 					type: "number",
-					description: "Cap per run (default 10, max 20)",
+					description:
+						"Cap per run (default 10, max 20). For a page with MANY image slots, prefer batches of ~6: call make_images repeatedly with max_images:6 until dry_run shows 0 placeholders left. Small batches finish well under the time budget — fewer skipped tail images, no perceived timeout.",
 				},
 				save_dir: {
 					type: "string",
@@ -2601,24 +2731,24 @@ async function ensureAccess() {
 		} else if (data.reason === "free_trial") {
 			result = {
 				ok: false,
-				message: `🚫 Le MCP Distribea n'est pas inclus dans l'essai gratuit. Passe au paiement pour l'activer : ${APP_URL}/account/billing`,
+				message: `🚫 The Distribea MCP is not included in the free trial. Switch to a paid plan to activate it: ${APP_URL}/account/billing`,
 			};
 		} else if (data.reason === "no_subscription") {
 			result = {
 				ok: false,
-				message: `🚫 Un abonnement Distribea actif est nécessaire pour utiliser le MCP. Abonne-toi ici : ${APP_URL}/account/billing`,
+				message: `🚫 An active Distribea subscription is required to use the MCP. Subscribe here: ${APP_URL}/account/billing`,
 			};
 		} else {
 			result = {
 				ok: false,
-				message: `🚫 Clé MCP invalide ou expirée — régénère-la sur ${APP_URL}/account/mcp`,
+				message: `🚫 Invalid or expired MCP key — regenerate it at ${APP_URL}/account/mcp`,
 			};
 		}
 	} catch {
 		result = {
 			ok: false,
 			transient: true,
-			message: `⚠ Impossible de vérifier ton abonnement (${APP_URL} ne répond pas). Réessaie dans un instant.`,
+			message: `⚠ Could not verify your subscription (${APP_URL} is not responding). Try again in a moment.`,
 		};
 	}
 	gateCache = {
@@ -2704,11 +2834,11 @@ async function handle(msg) {
 					{
 						name: "images-parfaites",
 						description:
-							"Habille la page (ou tout le site) d'images de marque : style, génération, branchement, og:image, favicon, ALT — tout en une fois.",
+							"Dress the page (or the whole site) with on-brand images: style, generation, wiring, og:image, favicon, ALT — all in one go.",
 						arguments: [
 							{
 								name: "page",
-								description: "Chemin de la page (vide = tout le projet)",
+								description: "Page path (empty = the whole project)",
 								required: false,
 							},
 						],
@@ -2724,13 +2854,13 @@ async function handle(msg) {
 			jsonrpc: "2.0",
 			id,
 			result: {
-				description: "Pipeline images complet Distribea",
+				description: "Full Distribea image pipeline",
 				messages: [
 					{
 						role: "user",
 						content: {
 							type: "text",
-							text: `Habille ${page ? `la page ${page}` : "ce projet"} avec des images de marque via Distribea MCP : 1) make_images sur ${page ? "cette page" : "tout le projet (sans page_path)"} (le style se déduit tout seul) ; 2) si je t'ai donné la photo d'une personne, create_reference d'abord ; 3) termine par brand_pack (logo + favicon + og:image en un appel) puis finish_images (ALT + WebP). Montre-moi le avant/après.`,
+							text: `Dress ${page ? `the page ${page}` : "this project"} with on-brand images via Distribea MCP: 1) make_images on ${page ? "this page" : "the whole project (no page_path)"} (the style is inferred automatically); 2) if I gave you a person's photo, create_reference first; 3) finish with brand_pack (logo + favicon + og:image in one call) then finish_images (ALT + WebP). Show me the before/after.`,
 						},
 					},
 				],
@@ -2788,7 +2918,7 @@ async function handle(msg) {
 					watchdog = setTimeout(() => {
 						reject(
 							new Error(
-								"⏱️ Opération trop longue (> 4 min 40). Les images déjà générées sont DÉJÀ branchées dans le code — relance le MÊME appel : il ne fera que ce qui manque, sans rien redébiter."
+								"⏱️ Operation took too long (> 4 min 40). The images already generated are ALREADY wired into the code — rerun the SAME call: it only does what's missing, without re-charging anything."
 							)
 						);
 					}, TOOL_TIMEOUT_MS);
@@ -2801,10 +2931,10 @@ async function handle(msg) {
 					: { images: [], ...out };
 			// Vrais crédits débités pendant l'appel + solde réel du compte.
 			if (CALL_CREDITS > 0 && LAST_BALANCE !== null) {
-				result.text += `\n\n💳 ${CALL_CREDITS} crédits — solde ${LAST_BALANCE}`;
+				result.text += `\n\n💳 ${CALL_CREDITS} credits — balance ${LAST_BALANCE}`;
 			}
 			if (result.text.length > MAX_RESULT_CHARS) {
-				result.text = `${result.text.slice(0, MAX_RESULT_CHARS)}\n… [réponse tronquée — limite de taille MCP]`;
+				result.text = `${result.text.slice(0, MAX_RESULT_CHARS)}\n… [response truncated — MCP size limit]`;
 			}
 			const content = [{ type: "text", text: result.text }];
 			for (const imgPath of result.images ?? []) {
