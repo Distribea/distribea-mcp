@@ -18,6 +18,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
+	copyFileSync,
 	existsSync,
 	mkdirSync,
 	readdirSync,
@@ -958,7 +959,8 @@ async function generateSlotImage(
 	saveDir,
 	fileBase,
 	excerpt,
-	crossSiteUnique = false
+	crossSiteUnique = false,
+	noCharacter = false
 ) {
 	const payload = {
 		slot: {
@@ -974,6 +976,9 @@ async function generateSlotImage(
 		client_ref: fileBase,
 		// Avatars d'avis : unicité tous-sites uniquement si l'abonné l'a demandé.
 		cross_site_unique: crossSiteUnique,
+		// "Cette page n'a AUCUN visage verrouillé" → coupe le rattachement auto du
+		// personnage (sinon la tête du fondateur se colle sur tous les portraits).
+		...(noCharacter ? { character: "none" } : {}),
 	};
 	let out;
 	let isAvatar = false;
@@ -1319,7 +1324,8 @@ async function runMakeImages(args, progress) {
 					saveDir,
 					`${slugify(slot.heading || slot.alt || "image")}-${String(idx + 1).padStart(2, "0")}`,
 					excerpt,
-					args.cross_site_unique === true
+					args.cross_site_unique === true,
+					args.no_character === true
 				);
 				// Jeton écrit AVANT le branchement : si la connexion coupe ici, un
 				// relancement re-branchera ce fichier sans le re-payer.
@@ -1523,11 +1529,18 @@ async function runGenerateImage(args, progress) {
 		1
 	);
 
+	// "none" = aucun personnage verrouillé → on le laisse passer au moteur mais il
+	// ne compte pas comme un personnage imposé pour le test UGC ci-dessous.
+	const lockedChar =
+		typeof args.character === "string" &&
+		args.character.trim().toLowerCase() !== "none"
+			? args.character
+			: null;
 	// Sujet « avis client / témoignage / avatar » → selfie UGC (moteur).
 	const isUgc =
 		/\b(avis|t[ée]moignages?|testimonials?|reviews?|avatars?|photo de profil)\b/i.test(
 			subject
-		) && !(args.character || args.product);
+		) && !(lockedChar || args.product);
 	const out = isUgc
 		? await engineUgcSerialized(projectDir, {
 				slot: {
@@ -1719,6 +1732,21 @@ const OUT_FORMAT_BY_EXT = {
 	".webp": "webp",
 };
 
+// Sauvegarde l'original UNE fois en "<nom>.original.<ext>" (comme finish_images)
+// avant un remplacement en place — pour ne jamais rien perdre. Best-effort.
+function backupOriginalOnce(src) {
+	const ext = extname(src);
+	const orig = `${src.slice(0, src.length - ext.length)}.original${ext}`;
+	try {
+		if (!existsSync(orig)) {
+			copyFileSync(src, orig);
+		}
+		return orig;
+	} catch {
+		return null;
+	}
+}
+
 async function runEditImage(args, progress) {
 	const projectDir = resolveIn(
 		process.cwd(),
@@ -1735,41 +1763,53 @@ async function runEditImage(args, progress) {
 	progress?.("🎨 Retouching (30-60 s)…", 0, 1);
 	const src = resolveIn(projectDir, args.image_path);
 	const srcExt = extname(src).toLowerCase();
+	// COMPORTEMENT UNIFIÉ : une modification (edit/redo) REMPLACE le fichier en
+	// place et garde l'original en "*.original" — le code ne bouge jamais, rien
+	// n'est perdu. Le détourage / agrandissement / élargissement produisent un
+	// asset DIFFÉRENT (transparent / ×4 / plus large) → fichier dérivé à côté.
+	const inPlace = action === "edit" || action === "redo";
 	const out = await engine("edit_image", projectDir, {
 		action,
 		image: await fileToDataUri(src),
 		instruction: args.instruction,
 		apply_style: args.apply_style === true,
 		aspect_ratio: args.aspect_ratio,
-		// redo/upscale remplacent en place → même format que la source.
+		// edit/redo/upscale gardent le format de la source (remplacement fidèle).
 		out_format:
-			action === "redo" || action === "upscale"
+			inPlace || action === "upscale"
 				? (OUT_FORMAT_BY_EXT[srcExt] ?? "webp")
 				: "webp",
 		pages_excerpt: pagesExcerpt(projectDir),
 		client_ref: action,
 	});
 	let outPath;
-	if (action === "redo") {
-		outPath = src; // remplacée EN PLACE — le code continue de marcher
+	let backup = null;
+	if (inPlace) {
+		backup = backupOriginalOnce(src);
+		outPath = src; // remplacé EN PLACE — le code continue de marcher
 	} else if (action === "remove_background") {
 		outPath = src.replace(/\.[a-z]+$/i, "-nobg.png");
 	} else if (action === "upscale") {
 		outPath = src.replace(/(\.[a-z]+)$/i, "-4x$1");
-	} else if (action === "extend") {
-		outPath = src.replace(/\.[a-z]+$/i, "-extended.webp");
 	} else {
-		outPath = src.replace(/\.[a-z]+$/i, "-edited.webp");
+		outPath = src.replace(/\.[a-z]+$/i, "-extended.webp");
 	}
 	await saveUrl(out.image.cdn_url, outPath);
+	const inPlaceNote = backup
+		? ` — replaced IN PLACE (the code did not move), original kept as ${relative(projectDir, backup)}`
+		: "";
+	const transparencyNote =
+		out.transparency_restored === true
+			? "\n🔲 Transparent input detected → transparency preserved and cropped to content (the logo was not flattened onto a grey box)."
+			: "";
 	const label = {
-		edit: "Retouch done",
-		redo: `Redone ✔ with your instruction ("${args.instruction}") — replaced IN PLACE, the code did not move`,
+		edit: `Retouch done${inPlaceNote}`,
+		redo: `Redone ✔ with your instruction ("${args.instruction}")${inPlaceNote}`,
 		remove_background: "Background removed",
 		upscale: "Upscaled ×4",
 		extend: `Widened to ${args.aspect_ratio ?? "21:9"}`,
 	}[action];
-	return `${label} ✔ (${out.credits} credits)\nfile: ${outPath} (${out.image.width}×${out.image.height}, ${Math.round(out.image.bytes / 1024)} KB)`;
+	return `${label} ✔ (${out.credits} credits)\nfile: ${outPath} (${out.image.width}×${out.image.height}, ${Math.round(out.image.bytes / 1024)} KB)${transparencyNote}`;
 }
 
 async function runSiteStyle(args, progress) {
@@ -2040,6 +2080,10 @@ async function runBrandPack(args, progress) {
 		}
 		texts.push(
 			[
+				out.spelling_warning ? out.spelling_warning : null,
+				out.vector_fallback
+					? `✍️ Wordmark rendered as clean vector text to GUARANTEE the spelling of "${out.spelling_read || "the brand name"}" (the AI lettering kept misspelling it).`
+					: null,
 				`Logo created ✔ with the typography specialist (${out.credits} credits)`,
 				`files: ${logoPath} (transparent) + ${whitePath} (white background)`,
 				wired
@@ -2047,7 +2091,9 @@ async function runBrandPack(args, progress) {
 					: args.page_path
 						? '⚠ No logo spot found on the page — add a placeholder in the header (<img src="https://placehold.co/200x60" alt="logo">) then rerun, or place /logo.png yourself.'
 						: "The favicon derives from it automatically. To SHOW it in the header, pass page_path with a logo placeholder there.",
-			].join("\n")
+			]
+				.filter(Boolean)
+				.join("\n")
 		);
 	};
 
@@ -2779,6 +2825,11 @@ const TOOLS = [
 					description:
 						"Default false: each of your sites draws reviewer faces independently. Pass true ONLY if the user explicitly wants reviewer faces to NEVER repeat across ALL their sites (account-wide uniqueness). Variety WITHIN a site is always enforced regardless.",
 				},
+				no_character: {
+					type: "boolean",
+					description:
+						"Default false. Pass true when THIS page has NO locked person to feature (e.g. a team page of DIFFERENT staff, a gallery of finished work): it stops any locked character (a founder's face…) from being auto-attached to the slots, so each portrait is a distinct person. Review/testimonial avatars are unaffected.",
+				},
 			},
 		},
 	},
@@ -2824,7 +2875,7 @@ const TOOLS = [
 				character: {
 					type: "string",
 					description:
-						"Optional: name or role of a locked character to feature (same face)",
+						'Optional: name or role of a locked character to feature (same face). Pass "none" to FORCE no character — stops a locked founder/team face from being auto-attached to this spot.',
 				},
 				product: {
 					type: "string",
@@ -2928,7 +2979,7 @@ const TOOLS = [
 			openWorldHint: true,
 		},
 		description:
-			"ONE door for every retouch of an existing image — action: 'edit' (default; plain-language change: remove an object, change the background, relight… apply_style matches the site look), 'redo' (« refais-la, mais… » feedback on a generated image — file replaced IN PLACE so the code keeps working), 'remove_background' (transparent PNG), 'upscale' (×4), 'extend' (widen to a new aspect_ratio, the scene continues seamlessly). Use ONLY on the user's explicit request — NEVER to 'improve' a result on your own initiative (each call bills the subscriber).",
+			"ONE door for every retouch of an existing image — action: 'edit' (default; plain-language change: remove an object, change the background, relight… apply_style matches the site look) and 'redo' (« refais-la, mais… » feedback) BOTH replace the file IN PLACE so the code never moves, keeping the original alongside as *.original (nothing is lost, no src to patch); 'remove_background' (transparent PNG), 'upscale' (×4) and 'extend' (widen to a new aspect_ratio, scene continues seamlessly) produce a DIFFERENT asset saved as a sibling file. A transparent input (logo) kept through edit/redo stays transparent (no grey-box flattening). Use ONLY on the user's explicit request — NEVER to 'improve' a result on your own initiative (each call bills the subscriber).",
 		inputSchema: {
 			type: "object",
 			properties: {
