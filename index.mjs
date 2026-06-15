@@ -16,7 +16,7 @@
 // ---------------------------------------------------------------------------
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -116,12 +116,100 @@ async function mapPool(items, limit, fn) {
 	return out;
 }
 
-// Clé projet STABLE par dossier — un abonné gère plusieurs sites, chacun garde
-// sa propre direction artistique (bug boulangerie/plombier 2026-06-10).
-function projectKeyOf(projectDirRaw) {
+// CLÉ HISTORIQUE par chemin — fragile : un dossier réutilisé/renommé héritait de
+// la mémoire d'un autre projet (bug « basket sur site assurance » 2026-06-15).
+// Gardée UNIQUEMENT pour migrer une fois l'ancienne mémoire vers la carte
+// d'identité (voir resolveProjectKey).
+function legacyPathKey(projectDirRaw) {
 	const projectDir = resolve(String(projectDirRaw)).toLowerCase();
 	const base = projectDir.split(/[\\/]/).filter(Boolean).pop() ?? "site";
 	return `${slugify(base)}-${createHash("md5").update(projectDir).digest("hex").slice(0, 8)}`;
+}
+
+// CARTE D'IDENTITÉ PROJET — un petit fichier .distribea/project.json déposé DANS
+// le dossier porte un identifiant unique. C'est LUI l'étiquette de la mémoire,
+// plus le chemin. Conséquences voulues (décision Ocean 2026-06-15) :
+//   • nouveau projet = mémoire neuve, même nom/chemin (pas d'héritage fantôme) ;
+//   • dossier renommé/déplacé = la mémoire suit ;
+//   • carte versionnée avec git = la mémoire suit la machine/le clone ;
+//   • carte perdue = on repêche le projet via list_projects + link_project.
+const CARD_DIR = ".distribea";
+const CARD_FILE = "project.json";
+const PROJECT_KEY_RE = /^[a-z0-9-]{1,80}$/;
+// Résolution mémoïsée par dossier (1 migration serveur max par projet/process).
+const projectKeyCache = new Map();
+
+function cardPathOf(projectDir) {
+	return join(projectDir, CARD_DIR, CARD_FILE);
+}
+
+function readProjectCard(projectDir) {
+	const path = cardPathOf(projectDir);
+	if (!existsSync(path)) {
+		return null;
+	}
+	try {
+		const card = JSON.parse(readFileSync(path, "utf8"));
+		const id = String(card?.id ?? "");
+		return PROJECT_KEY_RE.test(id) ? card : null;
+	} catch {
+		return null;
+	}
+}
+
+function writeProjectCard(projectDir, id, name) {
+	try {
+		mkdirSync(join(projectDir, CARD_DIR), { recursive: true });
+		writeFileSync(
+			cardPathOf(projectDir),
+			`${JSON.stringify({ id, name, created: new Date().toISOString() }, null, 2)}\n`
+		);
+		return true;
+	} catch (e) {
+		logErr(`project card write failed: ${e.message}`);
+		return false;
+	}
+}
+
+function mintProjectId(projectDir) {
+	const base = resolve(String(projectDir)).split(/[\\/]/).filter(Boolean).pop();
+	return `${slugify(base ?? "site")}-${randomBytes(5).toString("hex")}`;
+}
+
+// Étiquette EFFECTIVE d'un projet. Carte présente → son id. Sinon : on forge un
+// id neuf, on demande au serveur de DÉPLACER (une seule fois) l'éventuelle
+// mémoire de l'ancienne clé-chemin vers ce nouvel id — ce qui VIDE le seau de
+// l'ancienne clé, donc un futur projet au même chemin ne pourra plus en hériter.
+async function resolveProjectKey(projectDir) {
+	const dir = resolve(String(projectDir));
+	const cached = projectKeyCache.get(dir);
+	if (cached) {
+		return cached;
+	}
+	const card = readProjectCard(dir);
+	if (card) {
+		projectKeyCache.set(dir, card.id);
+		return card.id;
+	}
+	const id = mintProjectId(dir);
+	const legacy = legacyPathKey(dir);
+	try {
+		await callEngine("resolve_project", id, { legacy_key: legacy });
+	} catch (e) {
+		// FILET D'ORDRE DE DÉPLOIEMENT : si le serveur ne connaît pas encore
+		// resolve_project (télécommande publiée AVANT le push serveur) ou est
+		// hors-ligne, on NE crée PAS de carte et on retombe sur l'ancienne
+		// clé-chemin — exactement l'ancien comportement, donc AUCUNE mémoire
+		// perdue. Dès que le serveur connaît l'op, le prochain run forge l'id et
+		// migre proprement. L'ordre de déploiement n'a donc plus de conséquence.
+		logErr(`project resolve unavailable, using legacy key: ${e.message}`);
+		projectKeyCache.set(dir, legacy);
+		return legacy;
+	}
+	const base = dir.split(/[\\/]/).filter(Boolean).pop() ?? "site";
+	writeProjectCard(dir, id, base);
+	projectKeyCache.set(dir, id);
+	return id;
 }
 
 const MIME_BY_EXT = {
@@ -266,8 +354,14 @@ async function saveB64(b64, outPath) {
 // Crédits réellement débités pendant l'appel d'outil en cours + dernier solde.
 let CALL_CREDITS = 0;
 let LAST_BALANCE = null;
+// Compteur de cadeaux MCP (gratuit/essai) renvoyé par le moteur — affiché en
+// pied de réponse ("X images gratuites restantes"). null pour un abonné payant.
+let LAST_GIFT = null;
 
-async function engine(op, projectDir, payload = {}) {
+// Appel BAS NIVEAU : la clé projet est déjà résolue (pas de carte d'identité à
+// lire ici) — utilisé tel quel par resolveProjectKey pour la migration, et via
+// engine() pour tout le reste.
+async function callEngine(op, projectKey, payload = {}) {
 	let res;
 	try {
 		res = await fetch(`${APP_URL}/api/mcp/engine`, {
@@ -276,7 +370,7 @@ async function engine(op, projectDir, payload = {}) {
 			body: JSON.stringify({
 				token: TOKEN,
 				op,
-				project: projectKeyOf(projectDir),
+				project: projectKey,
 				...payload,
 			}),
 			signal: AbortSignal.timeout(ENGINE_TIMEOUT_MS),
@@ -294,6 +388,9 @@ async function engine(op, projectDir, payload = {}) {
 		if (typeof data.balance === "number") {
 			LAST_BALANCE = data.balance;
 		}
+		if (data.gift && typeof data.gift.remaining === "number") {
+			LAST_GIFT = data.gift;
+		}
 		return data;
 	}
 	if (res.status === 401) {
@@ -302,6 +399,18 @@ async function engine(op, projectDir, payload = {}) {
 		);
 	}
 	if (res.status === 402) {
+		// Cadeau MCP épuisé : ce n'est PAS un manque de crédits — c'est la limite
+		// d'images offertes (gratuit/essai). On invite à débloquer, pas à recharger.
+		if (data.reason === "free_gift_exhausted") {
+			throw new Error(
+				`🎁 You've used your 2 free Distribea images via the MCP. Subscribe to unlock your credits and keep generating: ${APP_URL}/account/billing`
+			);
+		}
+		if (data.reason === "trial_gift_exhausted") {
+			throw new Error(
+				`🎁 You've used your 5 free trial images via the MCP. Start your subscription now (immediate) to use all your credits: ${APP_URL}/account/mcp`
+			);
+		}
 		throw new Error(
 			`🚫 Not enough credits on your Distribea account (this operation costs ${data.credits ?? "?"} credits). Top up or upgrade your plan: ${APP_URL}/account/billing`
 		);
@@ -317,6 +426,12 @@ async function engine(op, projectDir, payload = {}) {
 		);
 	}
 	throw new Error(data.message ?? `Engine error (HTTP ${res.status})`);
+}
+
+// Appel HAUT NIVEAU : résout la clé du projet (carte d'identité + migration) puis
+// délègue. Tous les outils passent par ici.
+async function engine(op, projectDir, payload = {}) {
+	return await callEngine(op, await resolveProjectKey(projectDir), payload);
 }
 
 // Extrait des pages du projet — envoyé au moteur pour qu'il déduise le style
@@ -1666,6 +1781,16 @@ async function runCreateReference(args) {
 	const photo = args.photo_path
 		? await imageArgToDataUri(projectDir, args.photo_path)
 		: undefined;
+	// GARDE-FOU PRESSE-PAPIER (#5) : le presse-papier est COMMUN à toute la
+	// machine — il peut contenir une image d'un AUTRE projet (la fameuse basket).
+	// Quand une référence est verrouillée DEPUIS le presse-papier, on AFFICHE en
+	// clair ce qui a été capté + comment l'annuler, pour qu'un mauvais grab soit
+	// repéré tout de suite au lieu de se propager en silence sur toutes les images.
+	const fromClipboard = isClipboardRef(args.photo_path);
+	const clipNote = (name) =>
+		fromClipboard
+			? `📋 Captured from your CLIPBOARD (shared by your whole machine). I locked "${name}" with the look below — if that is NOT the image you meant to paste (e.g. a leftover from another project), re-run create_reference with the right image (same name replaces it), or forget_project to clear the pack.`
+			: null;
 
 	if (args.kind === "product" || args.kind === "place") {
 		const out = await engine("create_product", projectDir, {
@@ -1676,13 +1801,16 @@ async function runCreateReference(args) {
 			kind: args.kind,
 		});
 		return [
+			clipNote(out.name),
 			`${args.kind === "place" ? "Place" : "Product"} locked ✔`,
 			`name: ${out.name}`,
 			`look: ${out.description}`,
 			args.kind === "place"
 				? `This PLACE will be rebuilt IDENTICALLY in every image that references it (pass product: "${out.name}", or automatically when its name appears near a placeholder).`
 				: `This object will stay IDENTICAL in every image that references it (pass product: "${out.name}", or automatically when its name appears near a placeholder).`,
-		].join("\n");
+		]
+			.filter(Boolean)
+			.join("\n");
 	}
 	const out = await engine("create_character", projectDir, {
 		role: args.name ?? args.role,
@@ -1690,13 +1818,16 @@ async function runCreateReference(args) {
 		pages_excerpt: excerpt,
 	});
 	return [
+		clipNote(out.name),
 		"Character locked ✔",
 		`name: ${out.name}`,
 		`role: ${out.role}`,
 		`look: ${out.description}`,
 		"Their FACE stays 100% identical everywhere — only the staging changes (like a product).",
 		`To show them on the page: leave a placeholder where they go, then make_images / generate_image with character: "${out.name}" — it restages that exact face in a real on-brand scene. NEVER paste the raw photo into the page.`,
-	].join("\n");
+	]
+		.filter(Boolean)
+		.join("\n");
 }
 
 async function runBrandPack(args, progress) {
@@ -1842,7 +1973,13 @@ async function runBrandPack(args, progress) {
 		await doFavicons();
 		step += 1;
 		const title = String(args.title ?? status.style?.brand_name ?? "").trim();
-		if (title) {
+		if (status.style?.has_og) {
+			// Déjà générée une fois — on ne la refait pas (0 crédit). Pour la
+			// refaire volontairement : brand_pack action "social_image".
+			texts.push(
+				'Social image already exists — kept as is (0 credits). To redo it on purpose: brand_pack action: "social_image".'
+			);
+		} else if (title) {
 			progress?.(`🖼 ${step + 1}/3 Social image in progress…`, step, 3);
 			await doSocial(title);
 		} else {
@@ -2071,6 +2208,68 @@ async function runPackStatus(args) {
 		lines.push(`  • ${url}`);
 	}
 	return lines.join("\n");
+}
+
+// --- projets (carte d'identité : lister / oublier / reconnecter) -----------------
+
+async function runListProjects(args) {
+	const projectDir = resolveIn(
+		process.cwd(),
+		args.project_dir ?? process.cwd()
+	);
+	// La clé courante (résout/migre la carte au passage) — pour la marquer "ici".
+	const current = await resolveProjectKey(projectDir);
+	const out = await callEngine("list_projects", current, {});
+	const projects = out.projects ?? [];
+	if (!projects.length) {
+		return "No projects yet on your account.";
+	}
+	const lines = ["Your projects (most recent first):", ""];
+	for (const p of projects) {
+		const here = p.project_key === current ? " ← this folder" : "";
+		const bits = [
+			p.brand_name || p.metier || "(unnamed)",
+			`${p.images} image(s)`,
+			p.products.length ? `products: ${p.products.join(", ")}` : null,
+			`key: ${p.project_key}`,
+		].filter(Boolean);
+		lines.push(`• ${bits.join(" — ")}${here}`);
+	}
+	lines.push(
+		"",
+		'To reconnect a folder to one of these, run link_project with its "key".'
+	);
+	return lines.join("\n");
+}
+
+async function runForgetProject(args) {
+	const projectDir = resolveIn(
+		process.cwd(),
+		args.project_dir ?? process.cwd()
+	);
+	const key = await resolveProjectKey(projectDir);
+	const out = await engine("forget_project", projectDir, {});
+	return out.forgotten
+		? `🧹 This project's memory was cleared (style, characters, products). It starts fresh next time. (key: ${key})`
+		: "Nothing to forget — this project had no saved memory.";
+}
+
+async function runLinkProject(args) {
+	const projectDir = resolveIn(
+		process.cwd(),
+		args.project_dir ?? process.cwd()
+	);
+	const id = String(args.project_key ?? "").trim();
+	if (!PROJECT_KEY_RE.test(id)) {
+		throw new Error(
+			'project_key is required — the "key:" value shown by list_projects.'
+		);
+	}
+	const base =
+		resolve(projectDir).split(/[\\/]/).filter(Boolean).pop() ?? "site";
+	writeProjectCard(projectDir, id, base);
+	projectKeyCache.set(resolve(projectDir), id);
+	return `🔗 This folder is now linked to project ${id}. Its saved style, characters and products are back.`;
 }
 
 // --- rebrand (sites existants) ---------------------------------------------------
@@ -2732,7 +2931,7 @@ const TOOLS = [
 				photo_path: {
 					type: "string",
 					description:
-						'Real photo to lock (face, product or place): a file path — OR the word "clipboard" to use the image the user just copied/pasted (Ctrl/Cmd+C), no file needed.',
+						'Real photo to lock (face, product or place): a file path — OR the word "clipboard" to use the image the user just copied/pasted (Ctrl/Cmd+C), no file needed. Use "clipboard" ONLY when the user just copied an image FOR THIS reference: the clipboard is machine-wide and may still hold an unrelated image from another project — never guess it.',
 				},
 				project_dir: {
 					type: "string",
@@ -2795,6 +2994,74 @@ const TOOLS = [
 			},
 		},
 	},
+	{
+		name: "list_projects",
+		title: "List your projects",
+		annotations: {
+			readOnlyHint: true,
+			destructiveHint: false,
+			openWorldHint: false,
+		},
+		description:
+			"List all the website projects saved on your account (brand, products, image count, key). Use it to find a project whose folder you lost or renamed, then link_project to reconnect this folder to it.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				project_dir: {
+					type: "string",
+					description:
+						"Absolute path of the current project (default: current directory)",
+				},
+			},
+		},
+	},
+	{
+		name: "link_project",
+		title: "Reconnect this folder to a saved project",
+		annotations: {
+			readOnlyHint: false,
+			destructiveHint: false,
+			openWorldHint: false,
+		},
+		description:
+			"Reconnect the current folder to an existing saved project so its style, characters and products come back. Pass the project_key shown by list_projects. Writes the project's identity card (.distribea/project.json) into this folder.",
+		inputSchema: {
+			type: "object",
+			required: ["project_key"],
+			properties: {
+				project_key: {
+					type: "string",
+					description: 'The "key" value shown by list_projects.',
+				},
+				project_dir: {
+					type: "string",
+					description:
+						"Absolute path of the folder to link (default: current directory)",
+				},
+			},
+		},
+	},
+	{
+		name: "forget_project",
+		title: "Forget this project's memory",
+		annotations: {
+			readOnlyHint: false,
+			destructiveHint: true,
+			openWorldHint: false,
+		},
+		description:
+			"Wipe the current project's saved memory (locked style, characters, products) so it starts fresh. The folder keeps its identity; nothing on the page is touched. Use it when a reused folder carries over unwanted style or products.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				project_dir: {
+					type: "string",
+					description:
+						"Absolute path of the project to forget (default: current directory)",
+				},
+			},
+		},
+	},
 ];
 
 const TOOL_RUNNERS = {
@@ -2807,6 +3074,9 @@ const TOOL_RUNNERS = {
 	create_reference: runCreateReference,
 	finish_images: runFinishImages,
 	pack_status: runPackStatus,
+	list_projects: runListProjects,
+	link_project: runLinkProject,
+	forget_project: runForgetProject,
 	// Anciens noms — gardés en coulisse (compat tests / vieux clients).
 	blog_image: (a, p) => runBlogCover(a, p),
 	blog: (a, p) => runBlogCover(a, p),
@@ -2930,7 +3200,7 @@ async function handle(msg) {
 				serverInfo: {
 					name: "distribea-mcp",
 					title: "Distribea MCP",
-					version: "1.4.0",
+					version: "1.8.0",
 				},
 				instructions: INSTRUCTIONS,
 			},
@@ -3040,6 +3310,7 @@ async function handle(msg) {
 		let watchdog;
 		try {
 			CALL_CREDITS = 0;
+			LAST_GIFT = null;
 			const out = await Promise.race([
 				runner(params?.arguments ?? {}, progress),
 				new Promise((_, reject) => {
@@ -3060,6 +3331,14 @@ async function handle(msg) {
 			// Vrais crédits débités pendant l'appel + solde réel du compte.
 			if (CALL_CREDITS > 0 && LAST_BALANCE !== null) {
 				result.text += `\n\n💳 ${CALL_CREDITS} credits — balance ${LAST_BALANCE}`;
+			}
+			// Compteur de cadeaux (gratuit/essai) : on rappelle ce qui reste et,
+			// une fois à zéro, l'invitation à débloquer tous ses crédits.
+			if (LAST_GIFT) {
+				result.text +=
+					LAST_GIFT.remaining > 0
+						? `\n\n🎁 ${LAST_GIFT.remaining}/${LAST_GIFT.limit} free image(s) left via the MCP. Unlock all your credits: ${APP_URL}/account/billing`
+						: `\n\n🎁 Free images used up (${LAST_GIFT.limit}/${LAST_GIFT.limit}). Subscribe to unlock all your credits: ${APP_URL}/account/billing`;
 			}
 			if (result.text.length > MAX_RESULT_CHARS) {
 				result.text = `${result.text.slice(0, MAX_RESULT_CHARS)}\n… [response truncated — MCP size limit]`;

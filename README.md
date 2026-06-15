@@ -50,6 +50,9 @@ A [Distribea](https://distribea.com) subscription is required.
 | `create_reference` | Lock a recurring character (real photo supported) or product |
 | `finish_images` | Fix missing ALT texts + convert heavy images to WebP (free) |
 | `pack_status` | Current style, characters, credits |
+| `list_projects` | List your saved projects (brand, products, image count) to find one to reconnect (free) |
+| `link_project` | Reconnect the current folder to a saved project so its style/characters/products come back (free) |
+| `forget_project` | Wipe the current project's saved memory so it starts fresh (free) |
 
 ## Notes
 
