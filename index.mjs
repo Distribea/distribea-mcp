@@ -30,6 +30,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import {
+	basename,
 	dirname,
 	extname,
 	isAbsolute,
@@ -474,6 +475,11 @@ const NEXT_HEADING_RE = /<h[1-4][^>]*>/i;
 // Frontières de bloc : on ne relie JAMAIS une image au titre d'une autre section.
 const BLOCK_BOUNDARY_RE =
 	/<\/?(?:section|article|header|footer|main|nav|aside)\b[^>]*>/gi;
+// Frontières de SECTION seulement (les cartes article/li n'en sont PAS) : sert à
+// savoir si une image vit dans un bloc d'avis, car « avis / témoignages » est
+// presque toujours sur le titre de la SECTION, pas sur la carte d'avis elle-même.
+const SECTION_BOUNDARY_RE =
+	/<\/?(?:section|main|header|footer|nav|aside)\b[^>]*>/gi;
 
 // Le « bloc » qui contient l'image : entre la frontière de section juste avant
 // et juste après. Page mal codée (aucune balise de section) → fenêtre bornée
@@ -539,6 +545,37 @@ function headingAndContextForImg(content, imgStart, imgEnd) {
 	return { heading: best.text, context: desc };
 }
 
+// Texte de la SECTION qui entoure l'image (cartes article/li internes NON
+// coupées). Sert UNIQUEMENT à détecter un bloc d'avis : quand chaque avis est une
+// carte <article>, le titre « Témoignages » de la section serait sinon hors de
+// portée (article = frontière de bloc) et l'avatar passerait pour une photo de
+// marque au lieu d'un selfie client.
+function enclosingSectionText(content, imgStart, imgEnd) {
+	let lo = 0;
+	let hi = content.length;
+	for (const b of content.matchAll(SECTION_BOUNDARY_RE)) {
+		if (b.index < imgStart) {
+			lo = b.index + b[0].length;
+		} else if (b.index >= imgEnd) {
+			hi = b.index;
+			break;
+		}
+	}
+	return stripMarkup(content.slice(lo, hi)).slice(0, 600);
+}
+
+// Texte juste APRÈS l'image (le prénom de l'auteur s'y trouve), borné à la carte :
+// on s'arrête à l'image suivante ou à la frontière de carte/section. Sinon la
+// fenêtre déborde sur l'avis voisin → deux fois le même client ne produisent plus
+// la même signature → leurs visages ne sont plus partagés entre deux sections.
+function afterTextForImg(content, imgEnd) {
+	const win = content.slice(imgEnd, imgEnd + 600);
+	const stop = win.search(
+		/<(?:img|Image)\b|<\/?(?:article|li|section|main|aside)\b/i
+	);
+	return stripMarkup(stop >= 0 ? win.slice(0, stop) : win).slice(0, 250);
+}
+
 function walkFiles(dir, out = []) {
 	for (const name of readdirSync(dir)) {
 		const p = join(dir, name);
@@ -570,6 +607,27 @@ function walkImageFiles(dir, exts, out = []) {
 		}
 	}
 	return out;
+}
+
+// Un chemin pointe-t-il sur un dossier (sans planter s'il n'existe pas) ?
+function safeIsDir(p) {
+	try {
+		return statSync(p).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+// Nom de produit lu sur le nom du fichier : "tarte-pralinee.jpg" → "tarte
+// pralinee". Pas de sur-nettoyage (on ne casse pas un nom de marque) ; le
+// serveur compare en minuscules, la casse n'a donc aucune importance.
+function productNameFromFile(filePath) {
+	const raw = basename(filePath, extname(filePath));
+	const cleaned = raw
+		.replace(/[_\-.]+/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	return cleaned || raw;
 }
 
 function orientationOf(w, h, tag) {
@@ -631,11 +689,16 @@ function scanFileForSlots(file, content) {
 			alt: altM?.[2] ?? "",
 			heading,
 			context,
-			// Le prénom de l'auteur d'un avis est presque toujours SOUS sa photo.
-			after: stripMarkup(
-				content.slice(m.index + tag.length, m.index + tag.length + 500)
-			).slice(0, 250),
+			// Le prénom de l'auteur d'un avis est presque toujours SOUS sa photo
+			// (borné à la carte — ne déborde pas sur l'avis suivant).
+			after: afterTextForImg(content, m.index + tag.length),
 			orientation: orientationOf(w, h, tag),
+			// Dans un bloc d'avis ? On regarde la SECTION entière (le mot-clé vit
+			// sur le titre de la section, pas sur la carte) → fiable même quand
+			// chaque avis est une carte <article>.
+			inReviewSection: REVIEW_NEAR_RE.test(
+				enclosingSectionText(content, m.index, m.index + tag.length)
+			),
 			// Ratio réel de l'emplacement → le moteur génère au format le plus
 			// proche pour que `object-fit: cover` ne rogne pas le produit.
 			ratio: w && h ? w / h : null,
@@ -652,7 +715,7 @@ const AVATAR_HINT_RE = /rounded-full|avatar|profil|portrait|head-?shot/i;
 
 function isReviewAvatarSlot(slot) {
 	const near = `${slot.heading} ${slot.alt} ${slot.context} ${slot.after ?? ""}`;
-	if (!REVIEW_NEAR_RE.test(near)) {
+	if (!(slot.inReviewSection || REVIEW_NEAR_RE.test(near))) {
 		return false;
 	}
 	if (AVATAR_HINT_RE.test(slot.tag) || AVATAR_HINT_RE.test(slot.alt)) {
@@ -889,7 +952,14 @@ function engineUgcSerialized(projectDir, payload, nameKey) {
 }
 
 // Génère l'image d'UN slot (marque ou avatar) et l'écrit sur disque.
-async function generateSlotImage(projectDir, slot, saveDir, fileBase, excerpt) {
+async function generateSlotImage(
+	projectDir,
+	slot,
+	saveDir,
+	fileBase,
+	excerpt,
+	crossSiteUnique = false
+) {
 	const payload = {
 		slot: {
 			heading: slot.heading,
@@ -902,6 +972,8 @@ async function generateSlotImage(projectDir, slot, saveDir, fileBase, excerpt) {
 		},
 		pages_excerpt: excerpt,
 		client_ref: fileBase,
+		// Avatars d'avis : unicité tous-sites uniquement si l'abonné l'a demandé.
+		cross_site_unique: crossSiteUnique,
 	};
 	let out;
 	let isAvatar = false;
@@ -1246,7 +1318,8 @@ async function runMakeImages(args, progress) {
 					slot,
 					saveDir,
 					`${slugify(slot.heading || slot.alt || "image")}-${String(idx + 1).padStart(2, "0")}`,
-					excerpt
+					excerpt,
+					args.cross_site_unique === true
 				);
 				// Jeton écrit AVANT le branchement : si la connexion coupe ici, un
 				// relancement re-branchera ce fichier sans le re-payer.
@@ -1467,6 +1540,7 @@ async function runGenerateImage(args, progress) {
 				},
 				pages_excerpt: excerpt,
 				client_ref: "generate_image",
+				cross_site_unique: args.cross_site_unique === true,
 			})
 		: await engine("shot", projectDir, {
 				subject,
@@ -1772,12 +1846,100 @@ async function runSiteStyle(args, progress) {
 	};
 }
 
+// Import d'un DOSSIER entier de photos = toute une gamme verrouillée d'un coup
+// (le manque qui faisait inventer des produits : « parfois il oublie »). Chaque
+// image devient une référence produit, son nom lu sur le nom du fichier. 0 crédit
+// (le serveur ne fait qu'enregistrer la vraie photo, aucune génération).
+async function registerFolder(projectDir, dir, args, excerpt) {
+	const exts = new Set(Object.keys(MIME_BY_EXT));
+	const files = walkImageFiles(dir, exts).sort((a, b) =>
+		a.path.localeCompare(b.path)
+	);
+	if (!files.length) {
+		throw new Error(
+			`No image (.png/.jpg/.jpeg/.webp) found in folder ${relative(projectDir, dir) || dir}.`
+		);
+	}
+	// Un dossier = par défaut une GAMME DE PRODUITS (jamais des visages d'office) ;
+	// l'appelant peut forcer kind 'place' ou 'character'.
+	const kind =
+		args.kind === "place" || args.kind === "character" ? args.kind : "product";
+	const op = kind === "character" ? "create_character" : "create_product";
+	const MAX_BATCH = 60;
+	const tooMany = files.length > MAX_BATCH;
+	const batch = files.slice(0, MAX_BATCH);
+	const MAX_INPUT_BYTES = 12 * 1024 * 1024; // limite serveur par image
+
+	const done = [];
+	const failed = [];
+	await mapPool(batch, 4, async (f) => {
+		const label = basename(f.path);
+		if (f.bytes > MAX_INPUT_BYTES) {
+			failed.push(`${label} (> 12 MB — trop lourde)`);
+			return;
+		}
+		try {
+			const photo = await fileToDataUri(f.path);
+			const name = productNameFromFile(f.path);
+			const out = await engine(op, projectDir, {
+				name: kind === "character" ? undefined : name,
+				role: kind === "character" ? name : undefined,
+				photo,
+				pages_excerpt: excerpt,
+				kind: kind === "character" ? undefined : kind,
+			});
+			done.push(out.name);
+		} catch (e) {
+			failed.push(`${label} — ${e.message}`);
+		}
+	});
+
+	const noun =
+		kind === "place"
+			? "place(s)"
+			: kind === "character"
+				? "face(s)"
+				: "product(s)";
+	const lines = [
+		`${done.length} ${noun} locked from folder "${relative(projectDir, dir) || dir}" ✔ (0 credit)`,
+		...done.map((n) => `  • ${n}`),
+	];
+	if (failed.length) {
+		lines.push(`⚠ ${failed.length} skipped:`, ...failed.map((m) => `  ✗ ${m}`));
+	}
+	if (tooMany) {
+		lines.push(
+			`⚠ Only the first ${MAX_BATCH} images were registered (folder holds ${files.length}). Run again on the rest if needed.`
+		);
+	}
+	lines.push(
+		kind === "product"
+			? "make_images / generate_image now attach the RIGHT product photo to each image automatically — no more invented products."
+			: "Reused identically in every image that references them."
+	);
+	return lines.join("\n");
+}
+
 async function runCreateReference(args) {
 	const projectDir = resolveIn(
 		process.cwd(),
 		args.project_dir ?? process.cwd()
 	);
 	const excerpt = pagesExcerpt(projectDir);
+
+	// DOSSIER → toute la gamme d'un coup. On accepte un folder_path explicite OU
+	// un photo_path qui pointe en réalité sur un dossier (un agent peut mettre le
+	// chemin du dossier dans l'un ou l'autre). Le presse-papier n'est jamais un
+	// dossier.
+	const folderArg = args.folder_path ?? args.photo_path;
+	const folderResolved =
+		folderArg && !isClipboardRef(folderArg)
+			? resolveIn(projectDir, folderArg)
+			: null;
+	if (folderResolved && safeIsDir(folderResolved)) {
+		return await registerFolder(projectDir, folderResolved, args, excerpt);
+	}
+
 	const photo = args.photo_path
 		? await imageArgToDataUri(projectDir, args.photo_path)
 		: undefined;
@@ -1894,6 +2056,7 @@ async function runBrandPack(args, progress) {
 			source: args.source_path
 				? await imageArgToDataUri(projectDir, args.source_path)
 				: undefined,
+			background: args.background ? String(args.background) : undefined,
 			pages_excerpt: excerpt,
 			client_ref: "favicons",
 		});
@@ -1910,7 +2073,8 @@ async function runBrandPack(args, progress) {
 		texts.push(
 			[
 				`Icon pack generated ✔ (${creditNote}) → ${outDir}`,
-				"favicon.ico (16/32/48) · apple-touch-icon.png · icon-192.png · icon-512.png · site.webmanifest",
+				"favicon.ico (16/32/48) · apple-touch-icon.png · icon-192.png · icon-512.png · icon-192-maskable.png · icon-512-maskable.png · site.webmanifest",
+				"On a solid background (no transparency), centred with safe-area padding — visible on dark tabs, no black box on iOS, clean Android adaptive icon.",
 				"",
 				"Tags:",
 				`<link rel="icon" href="/favicon.ico" sizes="48x48" />`,
@@ -2565,7 +2729,7 @@ const TOOLS = [
 			openWorldHint: true,
 		},
 		description:
-			"⭐ THE flagship one-call tool. page_path → dresses that page; no page_path → scans the WHOLE project. Finds every placeholder/stock slot (placehold.co, picsum, unsplash, pexels…), locks/infers the style automatically, generates every image IN PARALLEL (recurring characters/products auto-used), saves optimised WebP and patches src+alt in the code. REVIEW/TESTIMONIAL sections are detected automatically: their avatars come out as ultra-real casual smartphone selfies (UGC look — car/bedroom/living-room backdrop, real skin), each reviewer keeps the SAME face across the site and no face is ever reused on another site. rebrand:true targets EXISTING real images instead: first call lists them for FREE, then apply:true regenerates them all in place (code untouched, originals kept as *.original).",
+			"⭐ THE flagship one-call tool. page_path → dresses that page; no page_path → scans the WHOLE project. Finds every placeholder/stock slot (placehold.co, picsum, unsplash, pexels…), locks/infers the style automatically, generates every image IN PARALLEL (recurring characters/products auto-used), saves optimised WebP and patches src+alt in the code. REVIEW/TESTIMONIAL sections are detected automatically: their avatars come out as ultra-real casual smartphone selfies (UGC look — car/bedroom/living-room backdrop, real skin), each reviewer keeps the SAME face across THIS site; your other sites are independent by default (set cross_site_unique:true to also keep reviewer faces distinct across ALL your sites). rebrand:true targets EXISTING real images instead: first call lists them for FREE, then apply:true regenerates them all in place (code untouched, originals kept as *.original).",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -2609,6 +2773,11 @@ const TOOLS = [
 					type: "boolean",
 					description:
 						"Default true: a review repeated in two sections of the SAME page generates ONE face and reuses it (saves credits). Pass false to regenerate each one (use only if the user explicitly asks for a different face per slot).",
+				},
+				cross_site_unique: {
+					type: "boolean",
+					description:
+						"Default false: each of your sites draws reviewer faces independently. Pass true ONLY if the user explicitly wants reviewer faces to NEVER repeat across ALL their sites (account-wide uniqueness). Variety WITHIN a site is always enforced regardless.",
 				},
 			},
 		},
@@ -2666,6 +2835,11 @@ const TOOLS = [
 					type: "boolean",
 					description:
 						"If true, the brand name appears as clean physical signage in the image",
+				},
+				cross_site_unique: {
+					type: "boolean",
+					description:
+						"UGC/review subjects only. Default false: reviewer faces are drawn per site. Pass true ONLY if the user wants reviewer faces to never repeat across ALL their sites.",
 				},
 				save_dir: {
 					type: "string",
@@ -2891,6 +3065,11 @@ const TOOLS = [
 					description:
 						'favicons: optional existing logo/icon to derive from — a file path, or "clipboard" to use a copied image',
 				},
+				background: {
+					type: "string",
+					description:
+						"favicons: solid background colour behind the icon (any CSS colour, e.g. '#ffffff' or 'oklch(...)'). Default white. A solid background is required — a transparent icon disappears on a dark tab and turns black on the iOS home screen.",
+				},
 				save_dir: { type: "string", description: "Default <project>/public" },
 				project_dir: {
 					type: "string",
@@ -2909,7 +3088,7 @@ const TOOLS = [
 			openWorldHint: true,
 		},
 		description:
-			"Lock a RECURRING reference reused identically across every image — kind 'character' (default): the same FACE everywhere, auto-cast or locked from a real photo via photo_path — a file path, OR the word \"clipboard\" to grab the photo the user just copied/pasted (Ctrl/Cmd+C, no file needed) (« c'est lui le professeur », « voici sa photo » → call this FIRST so every scene reuses that exact face); kind 'product' (e-commerce): the exact same object in every shot; kind 'place': the brand's real location (shop, workshop…) rebuilt identically in every scene (« voilà ma boutique » → photo_path). make_images and generate_image use them automatically when their name appears near a slot.",
+			"Lock a RECURRING reference reused identically across every image — kind 'character' (default): the same FACE everywhere, auto-cast or locked from a real photo via photo_path — a file path, OR the word \"clipboard\" to grab the photo the user just copied/pasted (Ctrl/Cmd+C, no file needed) (« c'est lui le professeur », « voici sa photo » → call this FIRST so every scene reuses that exact face); kind 'product' (e-commerce): the exact same object in every shot; kind 'place': the brand's real location (shop, workshop…) rebuilt identically in every scene (« voilà ma boutique » → photo_path). WHOLE PRODUCT RANGE AT ONCE — if the user gives a FOLDER of product photos (« voici le dossier avec toutes mes photos produits »), pass that folder path as photo_path (or folder_path): EVERY image inside is registered as a product reference in one call (0 credit), each product's name read from its filename. ALWAYS do this for a multi-product / e-commerce site so make_images attaches the right real photo to each image instead of inventing a product. make_images and generate_image use these references automatically.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -2931,7 +3110,12 @@ const TOOLS = [
 				photo_path: {
 					type: "string",
 					description:
-						'Real photo to lock (face, product or place): a file path — OR the word "clipboard" to use the image the user just copied/pasted (Ctrl/Cmd+C), no file needed. Use "clipboard" ONLY when the user just copied an image FOR THIS reference: the clipboard is machine-wide and may still hold an unrelated image from another project — never guess it.',
+						'Real photo to lock (face, product or place): a file path — OR the word "clipboard" to use the image the user just copied/pasted (Ctrl/Cmd+C), no file needed — OR the path of a FOLDER of product photos to register the WHOLE range at once (every image inside, name read from each filename, 0 credit). Use "clipboard" ONLY when the user just copied an image FOR THIS reference: the clipboard is machine-wide and may still hold an unrelated image from another project — never guess it.',
+				},
+				folder_path: {
+					type: "string",
+					description:
+						"Path of a FOLDER of product photos → registers EVERY image inside as a product reference in one call (0 credit), each name read from its filename. Use this when the user hands over a folder with their whole product range.",
 				},
 				project_dir: {
 					type: "string",
@@ -3172,7 +3356,7 @@ Also:
 - User gives style feedback ("plus chaleureux") → site_style (action refine): the change becomes permanent. User approves ONE image and wants the rest the SAME ("j'adore celle-là, fais les autres pareil") → site_style (action lock_image) with that file.
 - User points out the image got the SUBJECT/trade/role WRONG or off-topic (e.g. "a VTC is a private chauffeur, not a taxi", "show the baker working, not a customer", wrong product) → site_style (action refine) with that correction: it is recorded as a permanent scene rule and obeyed by EVERY future image (blog_cover included), so the same off-topic is never reproduced. Do this the moment a correction is given — never just regenerate and hope.
 - EXISTING site whose real images look cheap/stock/off-brand → make_images with rebrand:true: the first call lists every replaceable image for free, then apply:true rebrands them ALL in place (code untouched, originals kept as *.original).
-- REVIEW / TESTIMONIAL sections: just put a placeholder <img> next to each review and run make_images — the avatars come out as ultra-real casual smartphone selfies (UGC look: car, bedroom, living room…), NOT brand photos. Same reviewer name = same face everywhere on the site; a face is NEVER reused on another site. Never ship a review section without these avatars.
+- REVIEW / TESTIMONIAL sections: just put a placeholder <img> next to each review and run make_images — the avatars come out as ultra-real casual smartphone selfies (UGC look: car, bedroom, living room…), NOT brand photos. Same reviewer name = same face everywhere on the site; across your OTHER sites faces are independent by default. Never ship a review section without these avatars.
 - An EDITORIAL ARTICLE that still LACKS a cover/hero image → use blog_cover (NOT make_images, NOT placeholder stock). GUARDRAIL against noise: ONE cover per article, only when it is missing — if the article already has a real cover, leave it (never regenerate); a pure text/typo/SEO edit is NOT a trigger; never re-run on your own initiative (each call bills). Recognise it by MEANING, not by tags: any standalone piece written to be READ — a headline plus a body of prose on one topic (blog post, news, guide, tutorial, case study, magazine/journal piece) — in ANY language and on ANY stack (markdown/MDX, a headless CMS like WordPress/Sanity/Contentful, or a custom DB-driven route). Structural cues are only NON-EXHAUSTIVE hints, none of them required: folders/routes such as /blog /posts /articles /news /journal /actualités /magazine /guides, markdown/MDX frontmatter, or an <article> element — but if it simply READS like an article, it qualifies even with none of these. (It is the article body, not a marketing/landing/product page — those keep make_images.) You are the one writing/editing it, so you ALREADY have its text: pass its own title + body as article_text (or article_url / article_file). blog_cover reads the article, illustrates its SPECIFIC subject (not a generic trade photo), matches the site's locked style, adapts to the site's country (driving side, architecture…), and returns a 16:9 WebP + ALT. Default = the cover only; pass illustrations:N for in-article images. No style locked yet? it infers one from the project; if it still lacks the trade/brand it tells you what to provide — give it, don't guess.
 - One-off image into a SPECIFIC spot → generate_image (needs page_path + a placeholder there; it fills+wires that spot, never makes a homeless image). Retouch/redo/cutout/upscale/widen an existing one → edit_image with the right action.
 - Finish a page properly: brand_pack (logo + favicon + og:image in ONE call) then finish_images (ALT auto-fixed + WebP optimisation, free).
@@ -3200,7 +3384,7 @@ async function handle(msg) {
 				serverInfo: {
 					name: "distribea-mcp",
 					title: "Distribea MCP",
-					version: "1.8.0",
+					version: "1.9.0",
 				},
 				instructions: INSTRUCTIONS,
 			},
