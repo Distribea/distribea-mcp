@@ -18,6 +18,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+	existsSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
@@ -609,6 +610,35 @@ function patchTag(tag, oldSrc, newSrc, alt, dims) {
 	return newTag;
 }
 
+// A (Ocean 2026-06-15) : accroche le logo généré dans la page si un emplacement
+// logo y est prévu — un placeholder dont le alt/src/contexte parle de logo/marque,
+// OU celui désigné par `hint`. On ne DEVINE JAMAIS : pas d'emplacement logo
+// identifiable = on ne touche à rien (return null), pour ne pas casser le markup.
+function wireLogoIntoPage(pagePath, logoSrc, hint) {
+	const src = readFileSync(pagePath, "utf8");
+	const slots = scanFileForSlots(pagePath, src);
+	if (!slots.length) {
+		return null;
+	}
+	const target = hint
+		? slots.find((s) => s.src.includes(hint) || s.tag.includes(hint))
+		: slots.find((s) =>
+				/logo|brand|marque/i.test(`${s.alt} ${s.src} ${s.heading} ${s.context}`)
+			);
+	if (!target) {
+		return null;
+	}
+	const patched = src.replace(
+		target.tag,
+		patchTag(target.tag, target.src, logoSrc, target.alt || "Logo", null)
+	);
+	if (patched === src) {
+		return null;
+	}
+	writeFileSync(pagePath, patched);
+	return relative(process.cwd(), pagePath);
+}
+
 // --- modules optionnels du PROJET CLIENT (révélation avant/après) ---------------
 // sharp/playwright ne sont PAS des dépendances de cette télécommande : si le
 // projet de l'abonné les a, on offre la révélation visuelle ; sinon on la saute.
@@ -939,7 +969,7 @@ async function runMakeImages(args, progress) {
 				);
 		if (!allSlots.length) {
 			return pageMode
-				? `No placeholder/stock found on ${relative(projectDir, pagePath)}. First write <img src="https://placehold.co/…"> markers at the spots you want, then rerun make_images — or use generate_image for a free-form subject.`
+				? `No placeholder/stock found on ${relative(projectDir, pagePath)}. First write <img src="https://placehold.co/…"> markers at the spots you want, then rerun make_images (or generate_image to fill ONE of them with a specific subject).`
 				: "No placeholder or stock images found — nothing to fill.";
 		}
 		const slots = allSlots.slice(0, maxImages);
@@ -1248,76 +1278,124 @@ async function runGenerateImage(args, progress) {
 	if (!subject) {
 		throw new Error("subject is required");
 	}
-	progress?.(`🎨 Generating (≈ ${IMAGE_CREDITS_HINT} credits, 30-60 s)…`, 0, 1);
 	const projectDir = resolveIn(
 		process.cwd(),
 		args.project_dir ?? process.cwd()
 	);
+
+	// RÈGLE Ocean 2026-06-15 : on ne fabrique JAMAIS une image sans emplacement
+	// prévu pour l'accueillir — sinon c'est une image payée puis orpheline. Il
+	// faut une page + un placeholder <img src="placehold.co…"> : on le remplace
+	// et on branche l'image dans la foulée. Pas de page / pas de placeholder =
+	// AUCUNE génération, AUCUN débit — on guide vers le bon geste.
+	const pagePath = args.page_path
+		? resolveIn(projectDir, String(args.page_path))
+		: null;
+	if (!(pagePath && existsSync(pagePath))) {
+		return [
+			"⚠ I won't generate a homeless image — it would be billed, then never placed (0 credits spent here).",
+			"Tell me WHERE it goes:",
+			'  1. put a placeholder where you want it →  <img src="https://placehold.co/1200x600" alt="…">',
+			"  2. call me again with page_path set to that page.",
+			"I'll then generate it AND wire it straight into that spot. (For several at once: make_images.)",
+		].join("\n");
+	}
+	const slots = scanFileForSlots(pagePath, readFileSync(pagePath, "utf8"));
+	if (!slots.length) {
+		return [
+			`⚠ No placeholder found on ${relative(projectDir, pagePath)} — nothing to fill, so I generated nothing (0 credits).`,
+			'Add a placeholder where you want the image →  <img src="https://placehold.co/1200x600" alt="…">  then call me again.',
+		].join("\n");
+	}
+	// Emplacement cible : le placeholder désigné par `placeholder` (fragment de
+	// son src), sinon le 1er de la page. L'agent en met UN là où il veut CETTE image.
+	const target =
+		(args.placeholder
+			? slots.find(
+					(s) =>
+						s.src.includes(String(args.placeholder)) ||
+						s.tag.includes(String(args.placeholder))
+				)
+			: null) ?? slots[0];
+
 	const saveDir = args.save_dir
-		? resolveIn(process.cwd(), args.save_dir)
-		: resolve(process.cwd(), "public", "images");
-	const orientation = ["landscape", "portrait", "square"].includes(
+		? resolveIn(projectDir, args.save_dir)
+		: join(projectDir, "public", "images");
+	const prefix = String(args.public_prefix ?? "/images/");
+	// L'orientation suit la VRAIE forme du placeholder (sinon l'arg fourni).
+	const orientation = ["landscape", "portrait", "square", "wide"].includes(
 		args.orientation
 	)
 		? args.orientation
-		: "landscape";
+		: target.orientation;
 	const excerpt = pagesExcerpt(projectDir);
+	progress?.(
+		`🎨 Generating + placing (≈ ${IMAGE_CREDITS_HINT} credits, 30-60 s)…`,
+		0,
+		1
+	);
 
 	// Sujet « avis client / témoignage / avatar » → selfie UGC (moteur).
-	if (
+	const isUgc =
 		/\b(avis|t[ée]moignages?|testimonials?|reviews?|avatars?|photo de profil)\b/i.test(
 			subject
-		) &&
-		!(args.character || args.product)
-	) {
-		const out = await engineUgcSerialized(projectDir, {
-			// Le sujet va dans after : la case que le casting lit en priorité.
-			slot: { heading: "", alt: "", context: "", after: subject, orientation },
-			pages_excerpt: excerpt,
-			client_ref: "generate_image",
-		});
-		const fileName = `avatar-${slugify(subject)}.webp`;
-		const outPath = join(saveDir, fileName);
-		await saveUrl(out.image.cdn_url, outPath);
-		return [
-			out.reused
-				? `UGC avatar reused ✔ (same customer "${out.reviewer}" = same face — 0 credits)`
-				: `UGC avatar generated ✔ (${out.credits} credits)`,
-			`file: ${outPath}`,
-			`size: ${out.image.width}×${out.image.height} (optimised WebP)`,
-			`alt: ${out.alt}`,
-			out.reviewer
-				? `customer: ${out.reviewer} — their face will stay IDENTICAL on this site (and will NEVER be reused on another)`
-				: "",
-			"",
-			"Ready-to-paste:",
-			`<img src="/images/${fileName}" alt="${String(out.alt).replace(/"/g, "&quot;")}" width="${out.image.width}" height="${out.image.height}" loading="lazy" />`,
-		]
-			.filter(Boolean)
-			.join("\n");
-	}
+		) && !(args.character || args.product);
+	const out = isUgc
+		? await engineUgcSerialized(projectDir, {
+				slot: {
+					heading: target.heading || "",
+					alt: target.alt || "",
+					context: target.context || "",
+					after: subject,
+					orientation,
+					ratio: target.ratio,
+				},
+				pages_excerpt: excerpt,
+				client_ref: "generate_image",
+			})
+		: await engine("shot", projectDir, {
+				subject,
+				slot: { orientation, ratio: target.ratio },
+				character: args.character,
+				product: args.product,
+				brand_text: args.brand_text === true,
+				pages_excerpt: excerpt,
+				client_ref: "generate_image",
+			});
 
-	const out = await engine("shot", projectDir, {
-		subject,
-		slot: { orientation },
-		character: args.character,
-		product: args.product,
-		brand_text: args.brand_text === true,
-		pages_excerpt: excerpt,
-		client_ref: "generate_image",
-	});
-	const fileName = `${slugify(subject)}.webp`;
-	const outPath = join(saveDir, fileName);
-	await saveUrl(out.image.cdn_url, outPath);
+	const fileName = `${isUgc ? "avatar-" : ""}${slugify(subject)}.webp`;
+	await saveUrl(out.image.cdn_url, join(saveDir, fileName));
+	// Branchement immédiat : on remplace le placeholder ciblé par l'image réelle.
+	const current = readFileSync(target.file, "utf8");
+	if (!current.includes(target.tag)) {
+		throw new Error(
+			"placeholder vanished while generating — rerun (0 double-charge)"
+		);
+	}
+	await writeFile(
+		target.file,
+		current.replace(
+			target.tag,
+			patchTag(
+				target.tag,
+				target.src,
+				`${prefix}${fileName}`,
+				out.alt,
+				out.image
+			)
+		)
+	);
 	return [
 		out.style_inferred ? STYLE_INFERRED_NOTE : "",
-		`Image generated ✔ (${out.credits} credits)`,
-		`file: ${outPath}`,
-		`size: ${out.image.width}×${out.image.height} — ${Math.round(out.image.bytes / 1024)} KB (optimised WebP)`,
+		out.reused
+			? `Image placed ✔ — reused customer "${out.reviewer}" (0 credits)`
+			: `Image generated + placed ✔ (${out.credits} credits)`,
+		`wired into ${relative(projectDir, target.file)}  →  ${prefix}${fileName}`,
+		`size: ${out.image.width}×${out.image.height}${out.image.bytes ? ` — ${Math.round(out.image.bytes / 1024)} KB` : ""} (optimised WebP)`,
 		`alt: ${out.alt}`,
-		"",
-		"Ready-to-paste:",
-		`<img src="/images/${fileName}" alt="${String(out.alt).replace(/"/g, "&quot;")}" width="${out.image.width}" height="${out.image.height}" loading="lazy" />`,
+		out.reviewer
+			? `customer: ${out.reviewer} — same face stays on this site, never reused elsewhere`
+			: "",
 	]
 		.filter(Boolean)
 		.join("\n");
@@ -1616,7 +1694,8 @@ async function runCreateReference(args) {
 		`name: ${out.name}`,
 		`role: ${out.role}`,
 		`look: ${out.description}`,
-		`Their face will stay IDENTICAL in every image that references them (pass character: "${out.name}" to generate_image).`,
+		"Their FACE stays 100% identical everywhere — only the staging changes (like a product).",
+		`To show them on the page: leave a placeholder where they go, then make_images / generate_image with character: "${out.name}" — it restages that exact face in a real on-brand scene. NEVER paste the raw photo into the page.`,
 	].join("\n");
 }
 
@@ -1652,11 +1731,29 @@ async function runBrandPack(args, progress) {
 			await saveB64(out.preview_b64, prev);
 			images.push(prev);
 		}
+		// A : on ACCROCHE le logo dans la page quand un emplacement logo y est
+		// prévu — plus de logo fabriqué qui reste orphelin dans le dossier.
+		let wired = null;
+		if (args.page_path) {
+			const pagePath = resolveIn(projectDir, String(args.page_path));
+			if (existsSync(pagePath)) {
+				const prefix = String(args.public_prefix ?? "/");
+				wired = wireLogoIntoPage(
+					pagePath,
+					`${prefix}logo.png`,
+					args.logo_placeholder ? String(args.logo_placeholder) : null
+				);
+			}
+		}
 		texts.push(
 			[
 				`Logo created ✔ with the typography specialist (${out.credits} credits)`,
 				`files: ${logoPath} (transparent) + ${whitePath} (white background)`,
-				"The favicon will derive from it automatically (brand_pack action favicons).",
+				wired
+					? `→ wired into the page (${wired})`
+					: args.page_path
+						? '⚠ No logo spot found on the page — add a placeholder in the header (<img src="https://placehold.co/200x60" alt="logo">) then rerun, or place /logo.png yourself.'
+						: "The favicon derives from it automatically. To SHOW it in the header, pass page_path with a logo placeholder there.",
 			].join("\n")
 		);
 	};
@@ -2326,7 +2423,7 @@ const TOOLS = [
 			openWorldHint: true,
 		},
 		description:
-			"Generate ONE website image coherent with the locked style (and optionally a recurring character/product). Subjects mentioning a customer review/testimonial/avatar automatically switch to the UGC mode: ultra-real casual smartphone selfie of an everyday person (unique per site, same reviewer = same face). Delivers an optimised WebP + ALT text, ready to host. For a whole page or project, prefer make_images.",
+			'Generate ONE website image for a SPECIFIC spot AND wire it straight into the page — coherent with the locked style (and optionally a recurring character/product). Generation is tied to a placement: pass page_path + leave a placeholder (<img src="https://placehold.co/…">) where you want it; the image replaces that placeholder. NO page / NO placeholder = NOTHING is generated and NOTHING is billed (never produces an orphan image). Subjects mentioning a customer review/testimonial/avatar automatically switch to the UGC mode: ultra-real casual smartphone selfie of an everyday person (unique per site, same reviewer = same face). For a whole page or project, prefer make_images.',
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -2335,10 +2432,26 @@ const TOOLS = [
 					description:
 						"What the image shows, e.g. 'photo héro : villa moderne au lever du soleil'",
 				},
+				page_path: {
+					type: "string",
+					description:
+						"REQUIRED — the page that holds the placeholder this image fills. Without it, nothing is generated (no homeless/orphan image).",
+				},
+				placeholder: {
+					type: "string",
+					description:
+						"Optional: a fragment of the target placeholder's src/tag to pick WHICH one to fill (default: the first placeholder on the page).",
+				},
+				public_prefix: {
+					type: "string",
+					description:
+						"Optional URL prefix used in the patched <img src> (default '/images/'). Use a relative prefix like 'images/' for a plain static page where public/ is NOT the web root.",
+				},
 				orientation: {
 					type: "string",
 					enum: ["landscape", "portrait", "square"],
-					description: "Default landscape",
+					description:
+						"Optional: overrides the placeholder's own shape (by default the image follows the placeholder's dimensions).",
 				},
 				character: {
 					type: "string",
@@ -2537,7 +2650,7 @@ const TOOLS = [
 			openWorldHint: true,
 		},
 		description:
-			"The brand finishing pack — action 'all' (default) chains everything in ONE call: logo (typography specialist, perfect spelling — skipped if one already exists) → favicon/app-icon pack (favicon.ico 16/32/48, apple-touch-icon, 192/512 PNG, site.webmanifest + HTML tags) → og:image 1200×630 with the title written ON the image. Or one piece at a time: action 'logo' | 'favicons' | 'social_image'.",
+			"The brand finishing pack — action 'all' (default) chains everything in ONE call: logo (typography specialist, perfect spelling — skipped if one already exists) → favicon/app-icon pack (favicon.ico 16/32/48, apple-touch-icon, 192/512 PNG, site.webmanifest + HTML tags) → og:image 1200×630 with the title written ON the image. Or one piece at a time: action 'logo' | 'favicons' | 'social_image'. To SHOW the logo in the page (not just generate the file), pass page_path with a logo placeholder in the header (<img src=\"https://placehold.co/200x60\" alt=\"logo\">) — the generated logo is wired straight into it, so it never ends up generated-but-unused.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -2545,6 +2658,21 @@ const TOOLS = [
 					type: "string",
 					enum: ["all", "logo", "favicons", "social_image"],
 					description: "Default 'all'",
+				},
+				page_path: {
+					type: "string",
+					description:
+						"logo: the page to wire the logo into (it replaces a header logo placeholder — an <img> whose alt/src says 'logo', or the one named by logo_placeholder). Without it, the logo file is still created but not placed in the page.",
+				},
+				logo_placeholder: {
+					type: "string",
+					description:
+						"logo: optional fragment of the target logo placeholder's src/tag, to pick WHICH placeholder gets the logo (default: the one that looks like a logo/brand slot).",
+				},
+				public_prefix: {
+					type: "string",
+					description:
+						"logo: URL prefix used in the patched <img src> (default '/'). Use a relative prefix for a plain static page where public/ is NOT the web root.",
 				},
 				tagline: {
 					type: "string",
@@ -2770,13 +2898,13 @@ WHENEVER you create or modify a web page, section or component (landing page, he
 THE EASY PATH (prefer it): write the page with <img src="https://placehold.co/1200x600"> markers at every image spot, then ONE call to make_images(page_path) does everything — style locked or auto-inferred, all images generated IN PARALLEL, code patched. No page_path = the whole project. No setup needed: the style is inferred from the page itself if not locked.
 
 Also:
-- User provides a person's photo ("c'est lui le professeur") → create_reference (kind character, photo_path) FIRST, so make_images/generate_image reuse that exact face in every scene. If the user COPIED or PASTED the photo instead of giving a file (a pasted image in the chat, "voici sa photo", "je l'ai collée") pass photo_path:"clipboard" — the MCP reads the image straight from the user's clipboard, no file path needed (same trick for site_style lock_image image_path and brand_pack favicons source_path). A product that must stay identical in every shot → create_reference (kind product). Never paste the raw photo into the page when a styled scene would serve better.
+- User provides a person's photo ("c'est lui le professeur", a founder/team photo…) → create_reference (kind character, photo_path) FIRST, so make_images/generate_image reuse that exact face in every scene. If the user COPIED or PASTED the photo instead of giving a file (a pasted image in the chat, "voici sa photo", "je l'ai collée") pass photo_path:"clipboard" — the MCP reads the image straight from the user's clipboard, no file path needed (same trick for site_style lock_image image_path and brand_pack favicons source_path). A product that must stay identical in every shot → create_reference (kind product). HARD RULE — a person is treated like a product: keep the FACE 100% identical, only the staging changes. NEVER copy/convert the user's raw photo into the page (a flat, off-brand crop): the ONLY way a person appears on the page is a STAGED scene — leave a placeholder where they go, then make_images / generate_image fills it with character: "<name>", which restages that exact face in the site's world. Pasting the raw file is a bug, not a shortcut.
 - User gives style feedback ("plus chaleureux") → site_style (action refine): the change becomes permanent. User approves ONE image and wants the rest the SAME ("j'adore celle-là, fais les autres pareil") → site_style (action lock_image) with that file.
 - User points out the image got the SUBJECT/trade/role WRONG or off-topic (e.g. "a VTC is a private chauffeur, not a taxi", "show the baker working, not a customer", wrong product) → site_style (action refine) with that correction: it is recorded as a permanent scene rule and obeyed by EVERY future image (blog_cover included), so the same off-topic is never reproduced. Do this the moment a correction is given — never just regenerate and hope.
 - EXISTING site whose real images look cheap/stock/off-brand → make_images with rebrand:true: the first call lists every replaceable image for free, then apply:true rebrands them ALL in place (code untouched, originals kept as *.original).
 - REVIEW / TESTIMONIAL sections: just put a placeholder <img> next to each review and run make_images — the avatars come out as ultra-real casual smartphone selfies (UGC look: car, bedroom, living room…), NOT brand photos. Same reviewer name = same face everywhere on the site; a face is NEVER reused on another site. Never ship a review section without these avatars.
 - An EDITORIAL ARTICLE that still LACKS a cover/hero image → use blog_cover (NOT make_images, NOT placeholder stock). GUARDRAIL against noise: ONE cover per article, only when it is missing — if the article already has a real cover, leave it (never regenerate); a pure text/typo/SEO edit is NOT a trigger; never re-run on your own initiative (each call bills). Recognise it by MEANING, not by tags: any standalone piece written to be READ — a headline plus a body of prose on one topic (blog post, news, guide, tutorial, case study, magazine/journal piece) — in ANY language and on ANY stack (markdown/MDX, a headless CMS like WordPress/Sanity/Contentful, or a custom DB-driven route). Structural cues are only NON-EXHAUSTIVE hints, none of them required: folders/routes such as /blog /posts /articles /news /journal /actualités /magazine /guides, markdown/MDX frontmatter, or an <article> element — but if it simply READS like an article, it qualifies even with none of these. (It is the article body, not a marketing/landing/product page — those keep make_images.) You are the one writing/editing it, so you ALREADY have its text: pass its own title + body as article_text (or article_url / article_file). blog_cover reads the article, illustrates its SPECIFIC subject (not a generic trade photo), matches the site's locked style, adapts to the site's country (driving side, architecture…), and returns a 16:9 WebP + ALT. Default = the cover only; pass illustrations:N for in-article images. No style locked yet? it infers one from the project; if it still lacks the trade/brand it tells you what to provide — give it, don't guess.
-- One-off image → generate_image. Retouch/redo/cutout/upscale/widen an existing one → edit_image with the right action.
+- One-off image into a SPECIFIC spot → generate_image (needs page_path + a placeholder there; it fills+wires that spot, never makes a homeless image). Retouch/redo/cutout/upscale/widen an existing one → edit_image with the right action.
 - Finish a page properly: brand_pack (logo + favicon + og:image in ONE call) then finish_images (ALT auto-fixed + WebP optimisation, free).
 COST DISCIPLINE — NEVER iterate on your own. ONE make_images call dresses a page: the job is then DONE. Do NOT regenerate, redo, retouch or "improve" an image on your own initiative, do NOT call tools in a loop, do NOT re-run a call that succeeded — every generation bills the subscriber's credits and burns their tokens. Retouch or regenerate ONLY when the USER explicitly asks for it.
 
