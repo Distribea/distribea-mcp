@@ -376,71 +376,114 @@ let LAST_GIFT = null;
 // Appel BAS NIVEAU : la clé projet est déjà résolue (pas de carte d'identité à
 // lire ici) — utilisé tel quel par resolveProjectKey pour la migration, et via
 // engine() pour tout le reste.
+// Pause entre deux tentatives (backoff).
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Coups de mou de la passerelle (502/503/504) = pas une vraie réponse de l'API.
+// On ne les rejoue TOUT SEUL que pour les opérations SANS débit (lecture/util) :
+// pour une opération qui FABRIQUE une image, un 5xx peut survenir APRÈS le débit,
+// donc on ne rejoue pas automatiquement (zéro risque de double facturation) — on
+// renvoie un message clair invitant à relancer (rien n'a été débité en double).
+const TRANSIENT_STATUS = new Set([502, 503, 504]);
+const FREE_RETRY_OPS = new Set([
+	"status",
+	"resolve_project",
+	"list_projects",
+	"forget_project",
+	"alt_text",
+	"convert_webp",
+]);
+const RETRY_BACKOFF_MS = [700, 1500];
+
 async function callEngine(op, projectKey, payload = {}) {
-	let res;
-	try {
-		res = await fetch(`${APP_URL}/api/mcp/engine`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({
-				token: TOKEN,
-				op,
-				project: projectKey,
-				...payload,
-			}),
-			signal: AbortSignal.timeout(ENGINE_TIMEOUT_MS),
-		});
-	} catch (e) {
-		throw new Error(
-			`⚠ The Distribea engine is not responding (${APP_URL}): ${e.message}. Check your connection then try again.`
-		);
-	}
-	const data = await res.json().catch(() => ({}));
-	if (data.ok) {
-		if (typeof data.credits === "number") {
-			CALL_CREDITS += data.credits;
-		}
-		if (typeof data.balance === "number") {
-			LAST_BALANCE = data.balance;
-		}
-		if (data.gift && typeof data.gift.remaining === "number") {
-			LAST_GIFT = data.gift;
-		}
-		return data;
-	}
-	if (res.status === 401) {
-		throw new Error(
-			`🔑 This key is no longer valid (it was regenerated or revoked). Get the new block at ${APP_URL}/account/mcp and paste it back into your tool.`
-		);
-	}
-	if (res.status === 402) {
-		// Cadeau MCP épuisé : ce n'est PAS un manque de crédits — c'est la limite
-		// d'images offertes (gratuit/essai). On invite à débloquer, pas à recharger.
-		if (data.reason === "free_gift_exhausted") {
+	const maxAttempts = RETRY_BACKOFF_MS.length + 1;
+	let lastNetworkError = null;
+	for (let attempt = 0; attempt < maxAttempts; attempt++) {
+		let res;
+		try {
+			res = await fetch(`${APP_URL}/api/mcp/engine`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					token: TOKEN,
+					op,
+					project: projectKey,
+					...payload,
+				}),
+				signal: AbortSignal.timeout(ENGINE_TIMEOUT_MS),
+			});
+		} catch (e) {
+			// Aucune réponse reçue = rien n'a pu être traité ni débité → on peut
+			// retenter sans risque, quelle que soit l'opération.
+			lastNetworkError = e;
+			if (attempt < maxAttempts - 1) {
+				await delay(RETRY_BACKOFF_MS[attempt]);
+				continue;
+			}
 			throw new Error(
-				`🎁 You've used your 2 free Distribea images via the MCP. Subscribe to unlock your credits and keep generating: ${APP_URL}/account/billing`
+				`⚠ The Distribea engine is not responding (${APP_URL}): ${e.message}. Check your connection then try again.`
 			);
 		}
-		if (data.reason === "trial_gift_exhausted") {
+		const data = await res.json().catch(() => ({}));
+		if (data.ok) {
+			if (typeof data.credits === "number") {
+				CALL_CREDITS += data.credits;
+			}
+			if (typeof data.balance === "number") {
+				LAST_BALANCE = data.balance;
+			}
+			if (data.gift && typeof data.gift.remaining === "number") {
+				LAST_GIFT = data.gift;
+			}
+			return data;
+		}
+		if (res.status === 401) {
 			throw new Error(
-				`🎁 You've used your 5 free trial images via the MCP. Start your subscription now (immediate) to use all your credits: ${APP_URL}/account/mcp`
+				`🔑 This key is no longer valid (it was regenerated or revoked). Get the new block at ${APP_URL}/account/mcp and paste it back into your tool.`
 			);
 		}
-		throw new Error(
-			`🚫 Not enough credits on your Distribea account (this operation costs ${data.credits ?? "?"} credits). Top up or upgrade your plan: ${APP_URL}/account/billing`
-		);
-	}
-	if (res.status === 429) {
-		if (data.reason === "rate_limited") {
+		if (res.status === 402) {
+			// Cadeau MCP épuisé : ce n'est PAS un manque de crédits — c'est la limite
+			// d'images offertes (gratuit/essai). On invite à débloquer, pas à recharger.
+			if (data.reason === "free_gift_exhausted") {
+				throw new Error(
+					`🎁 You've used your 2 free Distribea images via the MCP. Subscribe to unlock your credits and keep generating: ${APP_URL}/account/billing`
+				);
+			}
+			if (data.reason === "trial_gift_exhausted") {
+				throw new Error(
+					`🎁 You've used your 5 free trial images via the MCP. Start your subscription now (immediate) to use all your credits: ${APP_URL}/account/mcp`
+				);
+			}
 			throw new Error(
-				"⏳ Too many requests at once — the service is throttling. Wait a minute then pick up where you left off."
+				`🚫 Not enough credits on your Distribea account (this operation costs ${data.credits ?? "?"} credits). Top up or upgrade your plan: ${APP_URL}/account/billing`
 			);
 		}
-		throw new Error(
-			`🛑 Daily cap reached on your Distribea account (${data.cap ?? "?"} operations/day). Try again tomorrow.`
-		);
+		if (res.status === 429) {
+			if (data.reason === "rate_limited") {
+				throw new Error(
+					"⏳ Too many requests at once — the service is throttling. Wait a minute then pick up where you left off."
+				);
+			}
+			throw new Error(
+				`🛑 Daily cap reached on your Distribea account (${data.cap ?? "?"} operations/day). Try again tomorrow.`
+			);
+		}
+		// Coup de mou passerelle : rejoué seul SEULEMENT pour les ops sans débit.
+		if (TRANSIENT_STATUS.has(res.status)) {
+			if (FREE_RETRY_OPS.has(op) && attempt < maxAttempts - 1) {
+				await delay(RETRY_BACKOFF_MS[attempt]);
+				continue;
+			}
+			throw new Error(
+				`⚠ Temporary engine glitch (HTTP ${res.status}) on "${op}". Nothing extra was charged — rerun the same call: anything already produced is reused or skipped (0 double-charge).`
+			);
+		}
+		throw new Error(data.message ?? `Engine error (HTTP ${res.status})`);
 	}
-	throw new Error(data.message ?? `Engine error (HTTP ${res.status})`);
+	throw new Error(
+		`⚠ The Distribea engine is not responding (${APP_URL}): ${lastNetworkError?.message ?? "unknown error"}. Check your connection then try again.`
+	);
 }
 
 // Appel HAUT NIVEAU : résout la clé du projet (carte d'identité + migration) puis
@@ -809,6 +852,40 @@ function reviewSignature(slot) {
 	return txt.slice(0, 200);
 }
 
+// --- paires AVANT / APRÈS ------------------------------------------------------
+// Détecte une paire avant/après : deux emplacements CONSÉCUTIFS du même fichier
+// dont l'ALT dit explicitement « avant » puis « après ». Volontairement STRICT
+// (on ne regarde que l'ALT, pas le titre de section qui est commun aux 2) — une
+// galerie « réalisations » sans alt avant/après n'est jamais transformée par
+// erreur. Le couple est ensuite généré par l'op serveur before_after : l'AVANT
+// sert de référence pour fabriquer l'APRÈS → même scène (demande Ocean 2026-06-16).
+const BEFORE_ALT_RE = /\b(avant|before)\b/i;
+const AFTER_ALT_RE = /\b(apr[eè]s|after)\b/i;
+function detectBeforeAfterPairs(slots) {
+	const pairs = [];
+	const usedTags = new Set();
+	for (let i = 0; i < slots.length - 1; i++) {
+		const a = slots[i];
+		const b = slots[i + 1];
+		if (usedTags.has(a.tag) || usedTags.has(b.tag)) {
+			continue;
+		}
+		if (a.file !== b.file) {
+			continue;
+		}
+		// Avatars d'avis exclus : un selfie client n'est jamais un avant/après.
+		if (isReviewAvatarSlot(a) || isReviewAvatarSlot(b)) {
+			continue;
+		}
+		if (BEFORE_ALT_RE.test(a.alt || "") && AFTER_ALT_RE.test(b.alt || "")) {
+			pairs.push({ before: a, after: b });
+			usedTags.add(a.tag);
+			usedTags.add(b.tag);
+		}
+	}
+	return pairs;
+}
+
 function resolveImageRef(projectDir, codeFile, src) {
 	if (/^(https?:|data:|\/\/)/.test(src)) {
 		return null;
@@ -882,6 +959,47 @@ function wireLogoIntoPage(pagePath, logoSrc, hint) {
 	}
 	writeFileSync(pagePath, patched);
 	return relative(process.cwd(), pagePath);
+}
+
+// Pose des balises <link>/<meta> dans le <head> d'une page HTML — pour que
+// favicon / manifest / og:image soient VRAIMENT branchés, pas seulement affichés
+// (retour beta #5 : wiring partiel). On n'agit que sur un vrai document HTML
+// (présence de </head>) : un fichier Next/JSX gère ses balises via l'API
+// metadata, on n'y touche pas (on laisse l'agent les recopier). Chaque balise
+// déjà présente (même rel / property) est ignorée → ré-exécution sûre.
+function tagSignature(tag) {
+	const rel = tag.match(/\brel\s*=\s*["']([^"']+)["']/i);
+	if (rel) {
+		return `rel:${rel[1].toLowerCase()}`;
+	}
+	const prop = tag.match(/\b(?:property|name)\s*=\s*["']([^"']+)["']/i);
+	if (prop) {
+		return `meta:${prop[1].toLowerCase()}`;
+	}
+	return tag.toLowerCase();
+}
+function injectHeadTags(pagePath, tagLines) {
+	let src;
+	try {
+		src = readFileSync(pagePath, "utf8");
+	} catch {
+		return null;
+	}
+	const headCloseM = src.match(/<\/head\s*>/i);
+	if (!headCloseM) {
+		return null;
+	}
+	const existing = new Set(
+		[...src.matchAll(/<(?:link|meta)\b[^>]*>/gi)].map((m) => tagSignature(m[0]))
+	);
+	const toAdd = tagLines.filter((t) => !existing.has(tagSignature(t)));
+	if (!toAdd.length) {
+		return { file: relative(process.cwd(), pagePath), added: 0 };
+	}
+	const block = `${toAdd.map((t) => `\t\t${t}`).join("\n")}\n\t`;
+	const patched = src.replace(headCloseM[0], `${block}${headCloseM[0]}`);
+	writeFileSync(pagePath, patched);
+	return { file: relative(process.cwd(), pagePath), added: toAdd.length };
 }
 
 // --- modules optionnels du PROJET CLIENT (révélation avant/après) ---------------
@@ -1232,6 +1350,15 @@ async function runMakeImages(args, progress) {
 		}
 		const slots = allSlots.slice(0, maxImages);
 
+		// Paires AVANT/APRÈS : générées ensemble (l'avant en référence de l'après)
+		// pour garder la même scène. On les SORT du flux normal — leurs deux
+		// emplacements ne passent ni par le partage d'avatars ni par le pool.
+		const beforeAfterPairs = detectBeforeAfterPairs(slots);
+		const pairedTags = new Set(
+			beforeAfterPairs.flatMap((p) => [p.before.tag, p.after.tag])
+		);
+		const soloSlots = slots.filter((s) => !pairedTags.has(s.tag));
+
 		// Partage d'avatars d'avis : si le MÊME texte d'avis apparaît dans 2
 		// emplacements de la page (hero + section avis, par exemple), on génère
 		// UN seul visage et on le branche partout. Désactivable avec
@@ -1242,7 +1369,7 @@ async function runMakeImages(args, progress) {
 		const followerSlots = [];
 		// sigLeaderIndex: signature → index du leader dans leaderSlots.
 		const sigLeaderIndex = new Map();
-		for (const slot of slots) {
+		for (const slot of soloSlots) {
 			const sig = shareAvatars ? reviewSignature(slot) : null;
 			if (sig && sigLeaderIndex.has(sig)) {
 				followerSlots.push({ slot, leaderIdx: sigLeaderIndex.get(sig) });
@@ -1254,6 +1381,8 @@ async function runMakeImages(args, progress) {
 			leaderSlots.push(slot);
 		}
 		const sharedCount = followerSlots.length;
+		// Chaque paire avant/après = 2 images facturées (l'avant + l'après retouché).
+		const pairImageCount = beforeAfterPairs.length * 2;
 
 		if (args.dry_run) {
 			// On annonce le SUJET prévu pour chaque slot (pas seulement « X slots ») :
@@ -1282,7 +1411,10 @@ async function runMakeImages(args, progress) {
 				sharedCount
 					? `🤝 Repeated reviews detected: ${sharedCount} slot(s) will share another's avatar (0 credits). Disable with share_avatars: false.`
 					: "",
-				`🧾 Estimate: ${leaderSlots.length} image(s) to generate ≈ ${leaderSlots.length * IMAGE_CREDITS_HINT} credits${sharedCount ? ` (+ ${sharedCount} reused slot(s), 0 credits)` : ""}. Avatars already known to the site also come out at 0 credits.`,
+				beforeAfterPairs.length
+					? `🔁 ${beforeAfterPairs.length} before/after pair(s) detected: each "after" is built FROM its "before" (same place, same framing) — ${pairImageCount} image(s) billed.`
+					: "",
+				`🧾 Estimate: ${leaderSlots.length + pairImageCount} image(s) to generate ≈ ${(leaderSlots.length + pairImageCount) * IMAGE_CREDITS_HINT} credits${sharedCount ? ` (+ ${sharedCount} reused slot(s), 0 credits)` : ""}. Avatars already known to the site also come out at 0 credits.`,
 				"Run again without dry_run to generate.",
 			]
 				.filter(Boolean)
@@ -1291,10 +1423,10 @@ async function runMakeImages(args, progress) {
 
 		// Garde-fou solde (affichage) — le verdict FINAL reste côté serveur.
 		const status = await engine("status", projectDir, {});
-		const estimate = leaderSlots.length * IMAGE_CREDITS_HINT;
+		const estimate = (leaderSlots.length + pairImageCount) * IMAGE_CREDITS_HINT;
 		if (status.balance < estimate) {
 			throw new Error(
-				`🚫 Not enough credits for ${leaderSlots.length} image(s) to generate (≈ ${estimate} credits, balance: ${status.balance} credits). Top up at ${APP_URL}/account/billing or lower max_images.`
+				`🚫 Not enough credits for ${leaderSlots.length + pairImageCount} image(s) to generate (≈ ${estimate} credits, balance: ${status.balance} credits). Top up at ${APP_URL}/account/billing or lower max_images.`
 			);
 		}
 		// Devis annoncé AVANT de lancer — en crédits de l'abonnement, jamais en argent.
@@ -1444,7 +1576,9 @@ async function runMakeImages(args, progress) {
 			}
 		});
 		const results = settled.filter(Boolean);
-		if (!(results.length || skipped.length)) {
+		// beforeAfterPairs : générées plus bas → ne pas conclure « rien généré »
+		// quand la page ne contient QUE des paires avant/après.
+		if (!(results.length || skipped.length || beforeAfterPairs.length)) {
 			throw new Error(
 				`No image generated — ${failures[0]?.message ?? "unknown error"}. Rerun make_images: nothing was double-charged.`
 			);
@@ -1480,6 +1614,117 @@ async function runMakeImages(args, progress) {
 				results.push(shared);
 			} catch (e) {
 				failures.push({ slot, message: e.message });
+			}
+		}
+
+		// Paires AVANT/APRÈS : l'avant sert de RÉFÉRENCE pour fabriquer l'après —
+		// même lieu, même cadrage, seul le résultat des travaux change. Au lieu de
+		// deux photos sans rapport (Ocean 2026-06-16). Séquentiel (rare, 1-2/page).
+		const slotForPayload = (s) => ({
+			heading: s.heading,
+			context: s.context,
+			alt: s.alt,
+			orientation: s.orientation,
+			ratio: s.ratio,
+			file: relative(projectDir, s.file),
+		});
+		for (const [pairIdx, pair] of beforeAfterPairs.entries()) {
+			if (Date.now() > softDeadline) {
+				skipped.push(pair.before, pair.after);
+				progress?.(
+					"⏸ before/after pair skipped (time budget) — rerun to finish",
+					doneCount,
+					leaderSlots.length
+				);
+				continue;
+			}
+			const beforeFile = `${slugify(pair.before.alt || "avant")}-ba${pairIdx + 1}-before.webp`;
+			const afterFile = `${slugify(pair.after.alt || "apres")}-ba${pairIdx + 1}-after.webp`;
+			try {
+				// Filet anti double-débit : un jeton posé sur l'emplacement APRÈS
+				// mémorise les DEUX fichiers déjà payés → une relance les re-branche
+				// pour 0 crédit au lieu de régénérer la paire.
+				const sentinel = readSlotSentinel(projectDir, pair.after);
+				if (sentinel?.pair) {
+					const reBefore = {
+						slot: pair.before,
+						fileName: sentinel.beforeFile,
+						alt: sentinel.beforeAlt,
+						dims: sentinel.beforeDims,
+						reused: true,
+						credits: 0,
+					};
+					const reAfter = {
+						slot: pair.after,
+						fileName: sentinel.afterFile,
+						alt: sentinel.afterAlt,
+						dims: sentinel.afterDims,
+						reused: true,
+						credits: 0,
+					};
+					await patchOne(reBefore);
+					await patchOne(reAfter);
+					clearSlotSentinel(projectDir, pair.after);
+					results.push(reBefore, reAfter);
+					progress?.(
+						"♻ before/after pair re-wired (0 credits)",
+						doneCount,
+						leaderSlots.length
+					);
+					continue;
+				}
+				progress?.(
+					'🔁 before/after — generating the "before", then the matching "after" from it…',
+					doneCount,
+					leaderSlots.length
+				);
+				const out = await engine("before_after", projectDir, {
+					before: slotForPayload(pair.before),
+					after: slotForPayload(pair.after),
+					pages_excerpt: excerpt,
+					client_ref: `ba-${pairIdx + 1}`,
+				});
+				await saveUrl(out.before.image.cdn_url, join(saveDir, beforeFile));
+				await saveUrl(out.after.image.cdn_url, join(saveDir, afterFile));
+				const rBefore = {
+					slot: pair.before,
+					fileName: beforeFile,
+					alt: out.before.alt,
+					dims: out.before.image,
+					reused: false,
+					credits: 0,
+				};
+				const rAfter = {
+					slot: pair.after,
+					fileName: afterFile,
+					alt: out.after.alt,
+					dims: out.after.image,
+					reused: false,
+					credits: 0,
+				};
+				writeSlotSentinel(projectDir, pair.after, {
+					pair: true,
+					beforeFile,
+					afterFile,
+					beforeAlt: out.before.alt,
+					afterAlt: out.after.alt,
+					beforeDims: out.before.image,
+					afterDims: out.after.image,
+				});
+				await patchOne(rBefore);
+				await patchOne(rAfter);
+				clearSlotSentinel(projectDir, pair.after);
+				results.push(rBefore, rAfter);
+				progress?.(
+					`✔ before/after wired in (${beforeFile} → ${afterFile})`,
+					doneCount,
+					leaderSlots.length
+				);
+			} catch (e) {
+				failures.push({
+					slot: pair.before,
+					message: `before/after pair: ${e.message}`,
+				});
 			}
 		}
 
@@ -1538,7 +1783,7 @@ async function runMakeImages(args, progress) {
 						].join("\n")
 					: "",
 				skipped.length
-					? `⏸ ${skipped.length} image(s) skipped to stay within the time budget (4 min 10) — RERUN the same call: the already-wired ones are skipped, only the remaining ones are generated (0 double-charge).`
+					? `⏸ ${results.length} done, ${skipped.length} still to do — I stopped before the tool's hard time limit so you'd get a clean result instead of a cut-off. This is normal on big pages, NOT an error. Just RERUN the exact same call: the already-wired images are skipped (0 extra credits), only the remaining ${skipped.length} are generated. Repeat until it reports 0 left.`
 					: "",
 				allSlots.length > slots.length
 					? `⚠ ${allSlots.length - slots.length} slot(s) left unfilled (max_images) — run again to continue.`
@@ -1607,6 +1852,16 @@ async function runGenerateImage(args, progress) {
 			`⚠ Nothing to fill on ${relative(projectDir, pagePath)}${args.placeholder ? ` matching "${args.placeholder}"` : ""} — I generated nothing (0 credits).`,
 			'Either add a placeholder where you want it →  <img src="https://placehold.co/1200x600" alt="…">  then call me again,',
 			'OR to REPLACE an existing image, pass placeholder:"<part of its filename, e.g. m-bakkali-01>".',
+		].join("\n");
+	}
+
+	// PREVIEW (dry_run) : on annonce la cible + le coût, on ne génère rien.
+	if (args.dry_run) {
+		return [
+			`Preview — would ${replacing ? "REPLACE" : "fill"} on ${relative(projectDir, pagePath)} [${target.orientation}]:`,
+			`  → ${replacing ? target.src : target.tag.slice(0, 80)}`,
+			`subject: “${subject}”`,
+			`🧾 Estimate: 1 image ≈ ${IMAGE_CREDITS_HINT} credits. Run again without dry_run to generate.`,
 		].join("\n");
 	}
 
@@ -2112,15 +2367,24 @@ async function runCreateReference(args) {
 			.filter(Boolean)
 			.join("\n");
 	}
+	const givenName = String(args.name ?? args.role ?? "").trim();
 	const out = await engine("create_character", projectDir, {
-		role: args.name ?? args.role,
+		role: givenName,
 		photo,
 		pages_excerpt: excerpt,
 	});
+	// Le moteur réduit le nom au prénom propre (titres « M./Mme/Dr » retirés).
+	// On le DIT clairement (retour beta #6 : normalisation silencieuse) — la
+	// recherche reste tolérante (tout texte qui contient le nom retrouve la réf).
+	const renamed =
+		givenName && out.name && givenName.toLowerCase() !== out.name.toLowerCase();
 	return [
 		clipNote(out.name),
 		"Character locked ✔",
 		`name: ${out.name}`,
+		renamed
+			? `(you passed "${givenName}" — stored as "${out.name}"; call it with "${out.name}" or any text that contains it, both work)`
+			: null,
 		`role: ${out.role}`,
 		`look: ${out.description}`,
 		"Their FACE stays 100% identical everywhere — only the staging changes (like a product).",
@@ -2144,9 +2408,18 @@ async function runBrandPack(args, progress) {
 	const outDir = args.save_dir
 		? resolveIn(projectDir, args.save_dir)
 		: join(projectDir, "public");
+	// Favicons + manifest = TOUJOURS à la racine servie (convention navigateurs ;
+	// le manifest référence ses icônes en "/icon-192.png"). On ne les met JAMAIS
+	// dans save_dir (retour beta #7 : un favicon dans images/ + un href "/favicon"
+	// ne matchaient pas). Racine = public/ si présent, sinon le dossier projet.
+	const publicDir = join(projectDir, "public");
+	const iconDir = existsSync(publicDir) ? publicDir : projectDir;
 	const excerpt = pagesExcerpt(projectDir);
 	const texts = [];
 	const images = [];
+	// Balises à brancher dans le <head> de la page (favicon / manifest / og:image)
+	// — plus seulement affichées (retour beta #5 : wiring partiel).
+	const headTags = [];
 
 	const doLogo = async () => {
 		const out = await engine("logo", projectDir, {
@@ -2184,6 +2457,7 @@ async function runBrandPack(args, progress) {
 					: null,
 				`Logo created ✔ with the typography specialist (${out.credits} credits)`,
 				`files: ${logoPath} (transparent) + ${whitePath} (white background)`,
+				"Which to use: logo.png (transparent) for the header and any light/photo background; logo-fond-blanc.png on dark or busy backgrounds where transparency would be unreadable; the favicon is derived from it automatically.",
 				wired
 					? `→ wired into the page (${wired})`
 					: args.page_path
@@ -2204,9 +2478,9 @@ async function runBrandPack(args, progress) {
 			pages_excerpt: excerpt,
 			client_ref: "favicons",
 		});
-		await mkdir(outDir, { recursive: true });
+		await mkdir(iconDir, { recursive: true });
 		for (const f of out.files) {
-			await saveB64(f.b64, join(outDir, f.name));
+			await saveB64(f.b64, join(iconDir, f.name));
 		}
 		const creditNote =
 			out.derived_from === "logo"
@@ -2214,16 +2488,21 @@ async function runBrandPack(args, progress) {
 				: out.derived_from === "source"
 					? "0 credits (derived from the provided file)"
 					: `${out.credits} credits (icon generated)`;
+		const faviconTags = [
+			`<link rel="icon" href="/favicon.ico" sizes="48x48" />`,
+			`<link rel="apple-touch-icon" href="/apple-touch-icon.png" />`,
+			`<link rel="manifest" href="/site.webmanifest" />`,
+		];
+		headTags.push(...faviconTags);
 		texts.push(
 			[
-				`Icon pack generated ✔ (${creditNote}) → ${outDir}`,
+				`Icon pack generated ✔ (${creditNote}) → ${iconDir}`,
 				"favicon.ico (16/32/48) · apple-touch-icon.png · icon-192.png · icon-512.png · icon-192-maskable.png · icon-512-maskable.png · site.webmanifest",
 				"On a solid background (no transparency), centred with safe-area padding — visible on dark tabs, no black box on iOS, clean Android adaptive icon.",
+				"Saved at the web root so the manifest's /icon-*.png paths resolve.",
 				"",
 				"Tags:",
-				`<link rel="icon" href="/favicon.ico" sizes="48x48" />`,
-				`<link rel="apple-touch-icon" href="/apple-touch-icon.png" />`,
-				`<link rel="manifest" href="/site.webmanifest" />`,
+				...faviconTags,
 			].join("\n")
 		);
 	};
@@ -2236,9 +2515,20 @@ async function runBrandPack(args, progress) {
 			client_ref: "og",
 		});
 		const file = `${slugify(title)}.jpg`;
-		const saveTo = join(projectDir, "public", "images", "og", file);
+		// Respecte save_dir comme le logo et les favicons (retour beta #4 :
+		// l'OG ignorait save_dir et créait sa propre arbo public/images/og).
+		const saveTo = join(outDir, "og", file);
 		await saveUrl(out.image.cdn_url, saveTo);
-		const publicPath = `/images/og/${file}`;
+		const prefix = String(args.public_prefix ?? "/");
+		const publicPath = `${prefix}og/${file}`.replace(/\/{2,}/g, "/");
+		const ogTags = [
+			`<meta property="og:image" content="${publicPath}" />`,
+			`<meta property="og:image:width" content="${out.image.width}" />`,
+			`<meta property="og:image:height" content="${out.image.height}" />`,
+			`<meta name="twitter:card" content="summary_large_image" />`,
+			`<meta name="twitter:image" content="${publicPath}" />`,
+		];
+		headTags.push(...ogTags);
 		texts.push(
 			[
 				`Social image generated ✔ (${out.credits} credits)`,
@@ -2246,11 +2536,7 @@ async function runBrandPack(args, progress) {
 				`alt: ${out.alt}`,
 				"",
 				"Meta tags:",
-				`<meta property="og:image" content="${publicPath}" />`,
-				`<meta property="og:image:width" content="${out.image.width}" />`,
-				`<meta property="og:image:height" content="${out.image.height}" />`,
-				`<meta name="twitter:card" content="summary_large_image" />`,
-				`<meta name="twitter:image" content="${publicPath}" />`,
+				...ogTags,
 			].join("\n")
 		);
 	};
@@ -2294,7 +2580,49 @@ async function runBrandPack(args, progress) {
 			texts.push("og:image skipped — provide a title for the social image.");
 		}
 	}
+
+	// Branchement réel des balises favicon/manifest/og dans le <head> de la page
+	// fournie (retour beta #5). Uniquement sur un vrai document HTML ; pour un
+	// projet Next/JSX (pas de </head>), on garde l'affichage des balises à coller.
+	if (args.page_path && headTags.length) {
+		const pagePath = resolveIn(projectDir, String(args.page_path));
+		if (existsSync(pagePath)) {
+			const injected = injectHeadTags(pagePath, headTags);
+			texts.push(
+				injected
+					? injected.added
+						? `→ ${injected.added} tag(s) wired into <head> of ${injected.file}.`
+						: `→ tags already present in ${injected.file} (nothing to add).`
+					: "ℹ The page isn't a plain HTML document (no </head>) — paste the tags above into your head/metadata yourself."
+			);
+		}
+	}
+
 	return { text: texts.join("\n\n———\n\n"), images };
+}
+
+// Extensions image équivalentes — pour repérer un fichier « manquant » qui
+// existe en réalité dans un AUTRE format (état pré-conversion WebP).
+const SIBLING_IMG_EXTS = [".webp", ".png", ".jpg", ".jpeg", ".avif", ".gif"];
+// Le même appel finish_images AUDITE puis CONVERTIT en WebP. Si le code pointe
+// déjà vers `logo.webp` alors que le disque n'a encore que `logo.png` (la
+// conversion vient APRÈS dans le même appel), l'audit criait « lien cassé » pour
+// un fichier qu'il s'apprêtait à créer 2 lignes plus bas (faux positif, retour
+// beta #2). On considère donc le lien valide si la MÊME image existe dans un
+// autre format sur le disque.
+function existsInAnotherImageFormat(projectDir, codeFile, src) {
+	const clean = src.split(/[?#]/)[0];
+	const m = clean.match(/^(.*)\.[a-z0-9]+$/i);
+	if (!m) {
+		return false;
+	}
+	for (const ext of SIBLING_IMG_EXTS) {
+		const ref = resolveImageRef(projectDir, codeFile, `${m[1]}${ext}`);
+		if (ref && ref !== "missing") {
+			return true;
+		}
+	}
+	return false;
 }
 
 async function runFinishImages(args, progress) {
@@ -2323,7 +2651,11 @@ async function runFinishImages(args, progress) {
 			const rel = relative(projectDir, file);
 			const local = resolveImageRef(projectDir, file, src);
 			if (local === "missing") {
-				issues.push(`✗ BROKEN LINK — ${rel} → ${src}`);
+				// Faux positif pré-conversion : la même image existe dans un autre
+				// format (ex. logo.png présent, logo.webp pas encore créé) → pas cassé.
+				if (!existsInAnotherImageFormat(projectDir, file, src)) {
+					issues.push(`✗ BROKEN LINK — ${rel} → ${src}`);
+				}
 				continue;
 			}
 			if (PLACEHOLDER_SRC_RE.test(src)) {
@@ -2898,7 +3230,8 @@ const TOOLS = [
 				},
 				dry_run: {
 					type: "boolean",
-					description: "Only list the slots found — no generation, 0 credit",
+					description:
+						"PREVIEW mode: lists every slot found + the planned subject of each + the exact credit estimate, and generates NOTHING (0 credit). Use it before a big run to know the cost upfront.",
 				},
 				max_images: {
 					type: "number",
@@ -2999,6 +3332,11 @@ const TOOLS = [
 					type: "string",
 					description:
 						"Absolute path of the website project (default: current directory)",
+				},
+				dry_run: {
+					type: "boolean",
+					description:
+						"PREVIEW mode: shows the target spot + the credit estimate and generates NOTHING (0 credit).",
 				},
 			},
 			required: ["subject"],
