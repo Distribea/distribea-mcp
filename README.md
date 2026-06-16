@@ -13,6 +13,15 @@ The heavy lifting (art direction, generation, billing) runs on the hosted
 Distribea engine. This package is only the local connector: it scans and
 patches **your** files, and contains no API keys and no secrets.
 
+## See it in action
+
+A plain landing page, dressed with on-brand product imagery in a single
+`make_images` call — no stock photos, no placeholders:
+
+<p align="center">
+  <img src="https://distribea-categories-images.fra1.cdn.digitaloceanspaces.com/mcp/distribea-before-after.gif" width="390" alt="Before / after: a landing page dressed with on-brand images by the Distribea MCP" />
+</p>
+
 ## Setup
 
 A [Distribea](https://distribea.com) subscription is required.

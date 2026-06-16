@@ -3029,12 +3029,43 @@ async function runRebrandImages(args, progress) {
 		args.project_dir ?? process.cwd()
 	);
 	const max = Math.max(1, Math.min(20, Number(args.max_images ?? 10)));
+	// Images que l'abonné a EXPLICITEMENT demandé de conserver (nom de fichier ou
+	// bout de chemin) — les seules épargnées par le « remplace tout » par défaut.
+	// Normalise les séparateurs (Windows \ → /) pour qu'un keep "/team/" ou un
+	// simple nom de fichier matchent quel que soit l'OS.
+	const normPath = (s) => String(s).toLowerCase().replace(/\\/g, "/");
+	const keepList = (Array.isArray(args.keep) ? args.keep : [])
+		.map((k) => normPath(k).trim())
+		.filter(Boolean);
+	const isKept = (c) =>
+		keepList.some(
+			(k) =>
+				normPath(c.path).includes(k) ||
+				[...c.usedIn].some((u) => normPath(u).includes(k))
+		);
+	// Portée optionnelle : ne remplacer que les images UTILISÉES dans ces fichiers
+	// (chemins relatifs) — sert au « réveille cette page » qui ne doit pas toucher
+	// les images du reste du site. Absent → tout le projet (comportement par défaut).
+	const scopeSet =
+		Array.isArray(args.scope_files) && args.scope_files.length
+			? new Set(args.scope_files.map((f) => normPath(f)))
+			: null;
+	const inScope = (c) =>
+		!scopeSet || [...c.usedIn].some((u) => scopeSet.has(normPath(u)));
 	const { candidates: found, placeholders } = scanRebrandCandidates(projectDir);
 
 	const candidates = [];
 	let tiny = 0;
+	let kept = 0;
 	let alreadyDone = 0;
 	for (const c of found) {
+		if (!inScope(c)) {
+			continue;
+		}
+		if (keepList.length && isKept(c)) {
+			kept += 1;
+			continue;
+		}
 		const st = statSync(c.path);
 		if (st.size > REBRAND_MAX_BYTES) {
 			continue;
@@ -3069,6 +3100,7 @@ async function runRebrandImages(args, progress) {
 			? `${placeholders} placeholder(s)/stock detected too → make_images (without rebrand) handles those.`
 			: "",
 		tiny ? `${tiny} small image(s) (pictograms) skipped.` : "",
+		kept ? `${kept} image(s) kept on request (not replaced).` : "",
 		alreadyDone
 			? `${alreadyDone} image(s) already rebranded in a previous run — left as-is, 0 credits (delete the matching *.original file to redo one).`
 			: "",
@@ -3262,6 +3294,74 @@ const TOOLS = [
 						"Default false. Pass true when THIS page has NO locked person to feature (e.g. a team page of DIFFERENT staff, a gallery of finished work): it stops any locked character (a founder's face…) from being auto-attached to the slots, so each portrait is a distinct person. Review/testimonial avatars are unaffected.",
 				},
 			},
+		},
+	},
+	{
+		name: "bring_alive",
+		title: "Bring a site to life (propose, place + fill, replace existing)",
+		annotations: {
+			readOnlyHint: false,
+			destructiveHint: true,
+			openWorldHint: true,
+		},
+		description:
+			'Make an EXISTING site feel alive with on-brand imagery. Two things at once: (1) ADDS images where sections have none (hero, testimonials with ONE face per reviewer, team/about, key benefits, gallery — sized to the real layout), and (2) by DEFAULT REPLACES every existing image with an on-brand one (stock photos, old pictures…). page_path = one page; OMIT page_path = the WHOLE site. WORKFLOW: call it once for a FREE proposal (new spots + the list of existing images that will be replaced, 0 credits); show it, ask the user which to KEEP; then call AGAIN with apply:true to place + fill the new spots AND replace the existing images in one go. Spare specific images with keep:["filename"]; pass replace_existing:false to only ADD images and leave existing ones untouched. Everything is reversible with undo:true.',
+		inputSchema: {
+			type: "object",
+			properties: {
+				page_path: {
+					type: "string",
+					description:
+						"Page file to bring alive (html/jsx/tsx…). It also follows the page's LOCAL component imports, so component-built sites (<Hero/>, <Reviews/>…) work too. OMIT to do the WHOLE site at once.",
+				},
+				project_dir: {
+					type: "string",
+					description: "Project path (default: current directory)",
+				},
+				apply: {
+					type: "boolean",
+					description:
+						"true = PLACE new spots, FILL them, and REPLACE existing images (after the user validated the free proposal). Default false = free proposal only, nothing touched.",
+				},
+				keep: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						'Existing images to SPARE from replacement — each a filename or path fragment (e.g. ["logo.png", "/team/"]). Everything else is replaced on-brand.',
+				},
+				replace_existing: {
+					type: "boolean",
+					description:
+						"Default true: existing images are replaced on-brand. Pass false to ONLY add images on empty spots and leave every existing image untouched.",
+				},
+				undo: {
+					type: "boolean",
+					description:
+						"true = restore the site to its state before bring_alive (puts back original code AND original images). Reverses the last run.",
+				},
+				place: {
+					type: "array",
+					description:
+						"apply only: the approved spots to place — each { anchor, tag } copied verbatim from the proposal. Omit to place ALL freshly proposed spots.",
+					items: {
+						type: "object",
+						properties: {
+							anchor: {
+								type: "string",
+								description:
+									"The verbatim page-text anchor where the image goes",
+							},
+							tag: {
+								type: "string",
+								description:
+									"The <img> placeholder tag to insert at that anchor",
+							},
+						},
+						required: ["anchor", "tag"],
+					},
+				},
+			},
+			required: ["page_path"],
 		},
 	},
 	{
@@ -3735,8 +3835,378 @@ const TOOLS = [
 	},
 ];
 
+// Frontière d'élément servant à poser une balise JUSTE APRÈS le bloc qui porte
+// l'ancre (un titre le plus souvent) — jamais au milieu d'une balise.
+const CLOSING_TAG_RE = /<\/[a-zA-Z][\w-]*\s*>/;
+// L'ancre se termine-t-elle DÉJÀ par une balise fermante ? (ex. "<h1>…</h1>")
+// → on pose pile après, sans aller chercher la balise du bloc suivant.
+const ANCHOR_ENDS_TAG_RE = /<\/[a-zA-Z][\w-]*\s*>\s*$/;
+
+// Pose la balise <img> juste après l'élément contenant l'ancre (texte verbatim).
+// Renvoie le nouveau contenu, ou null si l'ancre est introuvable.
+function insertTagAtAnchor(content, anchor, tag) {
+	const idx = content.indexOf(anchor);
+	if (idx < 0) {
+		return null;
+	}
+	const anchorEnd = idx + anchor.length;
+	let insertAt;
+	if (ANCHOR_ENDS_TAG_RE.test(anchor)) {
+		// Ancre = un élément complet → on pose immédiatement après.
+		insertAt = anchorEnd;
+	} else {
+		const tail = content.slice(anchorEnd);
+		const close = CLOSING_TAG_RE.exec(tail);
+		if (close) {
+			insertAt = anchorEnd + close.index + close[0].length;
+		} else {
+			const nl = content.indexOf("\n", idx);
+			insertAt = nl < 0 ? content.length : nl;
+		}
+	}
+	const lineStart = content.lastIndexOf("\n", idx) + 1;
+	const indent = (content.slice(lineStart, idx).match(/^[\t ]*/) || [""])[0];
+	return `${content.slice(0, insertAt)}\n${indent}${tag}${content.slice(insertAt)}`;
+}
+
+// --- "Rendre le site vivant" : sauvegardes & annulation ----------------------
+const BRINGALIVE_BAK = ".bringalive-bak";
+const ORIGINAL_IN_NAME_RE = /\.original\./i;
+// Tout-le-site : on borne le nombre de pages analysées (les plus grosses = le
+// plus de contenu) pour ne pas balayer chaque petit composant.
+const BRINGALIVE_MAX_PAGES = 10;
+
+// Toutes les images sauvegardées en "*.original.*" (posées par le rebrand).
+function findOriginalBackups(dir, out = []) {
+	for (const name of readdirSync(dir)) {
+		const p = join(dir, name);
+		let st;
+		try {
+			st = statSync(p);
+		} catch {
+			continue;
+		}
+		if (st.isDirectory()) {
+			if (!(SKIP_DIRS.has(name) || name.startsWith("."))) {
+				findOriginalBackups(p, out);
+			}
+		} else if (ORIGINAL_IN_NAME_RE.test(name)) {
+			out.push(p);
+		}
+	}
+	return out;
+}
+
+// Sauvegarde le code d'une page UNE seule fois (avant la toute 1re pose).
+function backupPageOnce(pagePath) {
+	const bak = `${pagePath}${BRINGALIVE_BAK}`;
+	if (!existsSync(bak)) {
+		copyFileSync(pagePath, bak);
+	}
+}
+
+// Annule : remet le code ET les images comme avant bring_alive.
+function undoBringAlive(projectDir) {
+	let code = 0;
+	let imgs = 0;
+	for (const f of walkFiles(projectDir)) {
+		const bak = `${f}${BRINGALIVE_BAK}`;
+		if (existsSync(bak)) {
+			copyFileSync(bak, f);
+			unlinkSync(bak);
+			code++;
+		}
+	}
+	for (const orig of findOriginalBackups(projectDir)) {
+		const real = orig.replace(ORIGINAL_IN_NAME_RE, ".");
+		try {
+			copyFileSync(orig, real);
+			unlinkSync(orig);
+			imgs++;
+		} catch {
+			// original illisible → on laisse, l'utilisateur le verra
+		}
+	}
+	return { code, imgs };
+}
+
+// Pose une liste d'emplacements sur UNE page (sauvegarde avant d'écrire).
+function placeSpotsOnPage(pagePath, toPlace) {
+	let content = readFileSync(pagePath, "utf8");
+	let placed = 0;
+	const missed = [];
+	for (const p of toPlace) {
+		const anchor = String(p?.anchor ?? "").trim();
+		const tag = String(p?.tag ?? p?.placeholder ?? "").trim();
+		if (!(anchor && tag)) {
+			continue;
+		}
+		const next = insertTagAtAnchor(content, anchor, tag);
+		if (next) {
+			content = next;
+			placed++;
+		} else {
+			missed.push(anchor);
+		}
+	}
+	if (placed > 0) {
+		backupPageOnce(pagePath);
+		writeFileSync(pagePath, content);
+	}
+	return { placed, missed };
+}
+
+async function planPage(projectDir, pagePath) {
+	const content = readFileSync(pagePath, "utf8");
+	const out = await engine("plan_layout", projectDir, { page_text: content });
+	return Array.isArray(out.slots) ? out.slots : [];
+}
+
+// --- #7 Sites 100% composants : suivre les imports LOCAUX d'une page ----------
+const IMPORT_FROM_RE = /(?:import|export)\b[^;]*?\bfrom\s*['"](\.[^'"]+)['"]/g;
+const IMPORT_CALL_RE = /\bimport\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g;
+const IMPORT_TRY_EXTS = [".tsx", ".jsx", ".vue", ".svelte", ".astro", ".html", ".htm"];
+const BRINGALIVE_MAX_IMPORTS = 25;
+
+// Résout un import relatif vers un VRAI fichier de page/composant scannable
+// (jamais un .ts/.js de logique pure : ils ne sont pas dans SCAN_EXTS).
+function resolveImportSpecifier(fromFile, spec) {
+	const base = resolve(dirname(fromFile), spec);
+	const tries = [
+		base,
+		...IMPORT_TRY_EXTS.map((e) => base + e),
+		...IMPORT_TRY_EXTS.map((e) => join(base, `index${e}`)),
+	];
+	for (const cand of tries) {
+		try {
+			if (
+				statSync(cand).isFile() &&
+				SCAN_EXTS.has(extname(cand).toLowerCase())
+			) {
+				return cand;
+			}
+		} catch {
+			// pas ce candidat
+		}
+	}
+	return null;
+}
+
+// Composants locaux importés par une page (1 niveau) → on les réveille aussi,
+// pour les sites où le texte vit dans des blocs tout-faits (<Hero/>, <Avis/>…).
+// Les composants utilitaires (Button…) n'ont pas de section → 0 emplacement.
+function resolveLocalImports(pagePath) {
+	let content;
+	try {
+		content = readFileSync(pagePath, "utf8");
+	} catch {
+		return [];
+	}
+	const specs = new Set();
+	for (const m of content.matchAll(IMPORT_FROM_RE)) {
+		specs.add(m[1]);
+	}
+	for (const m of content.matchAll(IMPORT_CALL_RE)) {
+		specs.add(m[1]);
+	}
+	const out = [];
+	const seen = new Set([pagePath]);
+	for (const spec of specs) {
+		const f = resolveImportSpecifier(pagePath, spec);
+		if (f && !seen.has(f)) {
+			seen.add(f);
+			out.push(f);
+		}
+		if (out.length >= BRINGALIVE_MAX_IMPORTS) {
+			break;
+		}
+	}
+	return out;
+}
+
+// "Rendre le site vivant" — orchestrateur. Sans apply → PROPOSE (gratuit) les
+// nouveaux emplacements ET liste les images existantes qui seront remplacées.
+// Avec apply → POSE les emplacements, les REMPLIT, et REMPLACE TOUT l'existant à
+// la marque (sauf `keep`). Page unique (page_path) ou TOUT le site (sans). Tout
+// est réversible (undo:true). L'abonné valide entre la proposition et l'apply.
+async function runBringAlive(args, progress) {
+	const projectDir = resolveIn(
+		process.cwd(),
+		args.project_dir ?? process.cwd()
+	);
+
+	// --- ANNULER ---
+	if (args.undo) {
+		const { code, imgs } = undoBringAlive(projectDir);
+		return code || imgs
+			? `Undone ✔ — restored ${code} page(s) and ${imgs} image(s) to their state before bring_alive.`
+			: "Nothing to undo — no bring_alive backup found.";
+	}
+
+	const wholeSite = !args.page_path;
+	const pages = wholeSite
+		? walkFiles(projectDir)
+				.map((f) => {
+					let size = 0;
+					try {
+						size = statSync(f).size;
+					} catch {
+						size = 0;
+					}
+					return { f, size };
+				})
+				.sort((a, b) => b.size - a.size)
+				.slice(0, BRINGALIVE_MAX_PAGES)
+				.map((x) => x.f)
+		: (() => {
+				// Page unique → la page ELLE-MÊME + ses composants locaux importés,
+				// pour réveiller aussi les sites où le texte vit dans des blocs.
+				const main = resolveIn(projectDir, String(args.page_path));
+				return [main, ...resolveLocalImports(main)];
+			})();
+	if (!pages.length) {
+		return "No page file found to bring alive.";
+	}
+	const scopeLabel = wholeSite
+		? "the whole site"
+		: relative(projectDir, pages[0]);
+	// Défaut Ocean : on remplace TOUT l'existant, sauf demande de conserver.
+	const replaceExisting = args.replace_existing !== false;
+
+	// --- APPLY : poser + remplir + remplacer l'existant ---------------------
+	if (args.apply) {
+		let placedTotal = 0;
+		const missedTotal = [];
+		if (Array.isArray(args.place) && !wholeSite) {
+			const r = placeSpotsOnPage(pages[0], args.place);
+			placedTotal += r.placed;
+			missedTotal.push(...r.missed);
+		} else {
+			for (const pg of pages) {
+				let slots = [];
+				try {
+					slots = await planPage(projectDir, pg);
+				} catch {
+					slots = [];
+				}
+				if (slots.length) {
+					const r = placeSpotsOnPage(
+						pg,
+						slots.map((s) => ({ anchor: s.anchor, tag: s.placeholder }))
+					);
+					placedTotal += r.placed;
+					missedTotal.push(...r.missed);
+				}
+			}
+		}
+		progress?.(`Placed ${placedTotal} new spot(s) — filling…`, 0, 1);
+		// Tout le site OU page unique avec composants (placeholders posés dans
+		// plusieurs fichiers) → remplissage à l'échelle du projet pour n'en rater
+		// aucun. Page unique sans composant → on se limite à la page.
+		const fillProjectWide = wholeSite || pages.length > 1;
+		const filled = await runMakeImages(
+			fillProjectWide
+				? { project_dir: args.project_dir }
+				: { page_path: args.page_path, project_dir: args.project_dir },
+			progress
+		);
+		const filledText =
+			typeof filled === "string" ? filled : (filled.text ?? "");
+		let rebrandText = "";
+		if (replaceExisting) {
+			progress?.("Replacing existing images on-brand…", 0, 1);
+			const rb = await runRebrandImages(
+				{
+					rebrand: true,
+					apply: true,
+					project_dir: args.project_dir,
+					keep: args.keep,
+					max_images: args.max_images,
+					// Page unique → on limite aux images de cette page (+ composants) ;
+					// tout-le-site → portée projet (scope_files omis).
+					scope_files: wholeSite
+						? undefined
+						: pages.map((p) => relative(projectDir, p)),
+				},
+				progress
+			);
+			rebrandText = typeof rb === "string" ? rb : (rb.text ?? "");
+		}
+		return [
+			`Brought ${scopeLabel} to life — placed ${placedTotal} new image spot(s)${missedTotal.length ? ` (${missedTotal.length} anchor(s) not found, skipped)` : ""}.`,
+			"",
+			"— New images —",
+			filledText,
+			replaceExisting ? "\n— Existing images replaced on-brand —" : "",
+			rebrandText,
+			"",
+			"↩ Changed your mind? Run bring_alive with undo:true to restore everything.",
+		]
+			.filter(Boolean)
+			.join("\n");
+	}
+
+	// --- PROPOSER (défaut, gratuit) -----------------------------------------
+	progress?.("Reading the page(s) and proposing…", 0, 1);
+	const blocks = [];
+	let totalSpots = 0;
+	for (const pg of pages) {
+		let slots = [];
+		try {
+			slots = await planPage(projectDir, pg);
+		} catch {
+			slots = [];
+		}
+		if (!slots.length) {
+			continue;
+		}
+		totalSpots += slots.length;
+		blocks.push(`\n■ ${relative(projectDir, pg)} — ${slots.length} spot(s):`);
+		slots.forEach((s, i) => {
+			blocks.push(
+				`  #${i + 1} ${s.section} (${s.role})  ${s.width}x${s.height}`,
+				`     anchor: ${s.anchor}`,
+				`     tag: ${s.placeholder}`
+			);
+		});
+	}
+	let existingBlock = "";
+	if (replaceExisting) {
+		try {
+			const rb = await runRebrandImages(
+				{
+					rebrand: true,
+					project_dir: args.project_dir,
+					keep: args.keep,
+					scope_files: wholeSite
+						? undefined
+						: pages.map((p) => relative(projectDir, p)),
+				},
+				progress
+			);
+			const rbText = typeof rb === "string" ? rb : (rb.text ?? "");
+			existingBlock = `\n— Existing images that WILL be replaced on-brand (default; pass replace_existing:false to keep them all, or keep:["filename"] to spare specific ones) —\n${rbText}`;
+		} catch {
+			// pas d'images existantes lisibles → on ignore
+		}
+	}
+	if (totalSpots === 0 && !existingBlock) {
+		return `${scopeLabel} already reads fine — nothing to add (0 credits).`;
+	}
+	return [
+		`Bring ${scopeLabel} to life — ${totalSpots} new image spot(s) proposed (nothing generated yet, 0 credits):`,
+		...blocks,
+		existingBlock,
+		"",
+		'👉 SHOW this to the user, ASK which spots/images to KEEP. Then call bring_alive AGAIN with apply:true to PLACE + FILL the new spots AND replace existing images on-brand in one go. Spare specific images with keep:["filename"], or pass replace_existing:false to leave existing images untouched. Everything is reversible with undo:true.',
+	]
+		.filter(Boolean)
+		.join("\n");
+}
+
 const TOOL_RUNNERS = {
 	make_images: runMakeImages,
+	bring_alive: runBringAlive,
 	generate_image: runGenerateImage,
 	blog_cover: runBlogCover,
 	edit_image: runEditImage,
@@ -3871,7 +4341,7 @@ async function handle(msg) {
 				serverInfo: {
 					name: "distribea-mcp",
 					title: "Distribea MCP",
-					version: "1.11.0",
+					version: "1.12.1",
 				},
 				instructions: INSTRUCTIONS,
 			},
