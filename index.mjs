@@ -337,7 +337,20 @@ async function imageArgToDataUri(projectDir, value) {
 }
 
 async function saveUrl(url, outPath) {
-	const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+	let res;
+	try {
+		res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+	} catch (e) {
+		// Erreur réseau brute (« fetch failed » / timeout) en récupérant l'image
+		// déjà générée sur le CDN : on la rend lisible au lieu d'un message opaque
+		// (retour beta #3). L'image est PAYÉE et stockée côté serveur — relancer
+		// make_images la re-branche sans la re-générer (0 crédit en plus).
+		const reason =
+			e?.name === "TimeoutError" ? "timed out" : e?.message || "network error";
+		throw new Error(
+			`couldn't download the generated image (${reason}) — it was created and billed; rerun make_images to wire it in (no double-charge)`
+		);
+	}
 	if (!res.ok) {
 		throw new Error(`download failed (HTTP ${res.status}) — ${url}`);
 	}
@@ -706,6 +719,59 @@ function scanFileForSlots(file, content) {
 		});
 	}
 	return slots;
+}
+
+// Cherche un <img> DÉJÀ rempli (image RÉELLE, pas un placeholder) dont le src ou
+// le tag contient `fragment` — pour ÉCRASER une image existante via generate_image
+// sans devoir passer par edit_image (retour beta #7 : remplacer un visage
+// générique « m-bakkali-01.webp » par le vrai sans détour). Renvoie un slot
+// exploitable (même forme que scanFileForSlots), ou null.
+function findExistingImgByFragment(file, content, fragment) {
+	const frag = String(fragment ?? "").trim();
+	if (!frag) {
+		return null;
+	}
+	for (const m of content.matchAll(IMG_TAG_RE)) {
+		const tag = m[0];
+		const srcM = tag.match(/\bsrc\s*=\s*\{?\s*(["'])([\s\S]*?)\1/);
+		if (!srcM) {
+			continue;
+		}
+		const src = srcM[2];
+		// Les placeholders sont gérés par le chemin normal — ici on ne vise QUE des
+		// images déjà posées.
+		if (PLACEHOLDER_SRC_RE.test(src)) {
+			continue;
+		}
+		if (!(src.includes(frag) || tag.includes(frag))) {
+			continue;
+		}
+		const altM = tag.match(/\balt\s*=\s*\{?\s*(["'])([\s\S]*?)\1/);
+		const wM = tag.match(/\bwidth\s*=\s*[{"']*(\d+)/);
+		const hM = tag.match(/\bheight\s*=\s*[{"']*(\d+)/);
+		const w = wM ? Number(wM[1]) : null;
+		const h = hM ? Number(hM[1]) : null;
+		const { heading, context } = headingAndContextForImg(
+			content,
+			m.index,
+			m.index + tag.length
+		);
+		return {
+			file,
+			tag,
+			src,
+			alt: altM?.[2] ?? "",
+			heading,
+			context,
+			after: afterTextForImg(content, m.index + tag.length),
+			orientation: orientationOf(w, h, tag),
+			inReviewSection: REVIEW_NEAR_RE.test(
+				enclosingSectionText(content, m.index, m.index + tag.length)
+			),
+			ratio: w && h ? w / h : null,
+		};
+	}
+	return null;
 }
 
 // Détection des cases avis/témoignages (texte du projet → visible côté client,
@@ -1190,11 +1256,28 @@ async function runMakeImages(args, progress) {
 		const sharedCount = followerSlots.length;
 
 		if (args.dry_run) {
+			// On annonce le SUJET prévu pour chaque slot (pas seulement « X slots ») :
+			// l'ALT décrit le contenu réel, sinon le titre de section, sinon « déduit
+			// du contexte ». Les avatars d'avis sont signalés (selfie UGC). On valide
+			// donc en connaissance de cause, plus à l'aveugle (retour beta #14).
+			const describeSubject = (s) => {
+				if (isReviewAvatarSlot(s)) {
+					return "👤 avatar UGC (selfie client) — auto from the review text";
+				}
+				const subj = oneLine(s.alt || "").trim();
+				if (subj) {
+					return `“${subj}”`;
+				}
+				const head = oneLine(s.heading || "").trim();
+				return head
+					? `(no alt — inferred from section “${head}”)`
+					: "(no alt — inferred from nearby text)";
+			};
 			return [
-				`Found ${allSlots.length} placeholder/stock slot(s)${allSlots.length > slots.length ? ` (would fill the first ${slots.length})` : ""}:`,
+				`Found ${allSlots.length} placeholder/stock slot(s)${allSlots.length > slots.length ? ` (would fill the first ${slots.length})` : ""} — planned subject per slot:`,
 				...slots.map(
 					(s, i) =>
-						`${i + 1}. ${relative(projectDir, s.file)} — ${s.src.slice(0, 70)} [${s.orientation}]${s.heading ? ` — section: "${s.heading}"` : ""}`
+						`${i + 1}. ${relative(projectDir, s.file)} [${s.orientation}] → ${describeSubject(s)}`
 				),
 				sharedCount
 					? `🤝 Repeated reviews detected: ${sharedCount} slot(s) will share another's avatar (0 credits). Disable with share_avatars: false.`
@@ -1322,7 +1405,11 @@ async function runMakeImages(args, progress) {
 					projectDir,
 					slot,
 					saveDir,
-					`${slugify(slot.heading || slot.alt || "image")}-${String(idx + 1).padStart(2, "0")}`,
+					// Nom de fichier = l'ALT d'abord (il décrit le CONTENU réel de
+					// l'image : « electricien-tableau »), titre de section seulement en
+					// repli. Sinon « salle-de-bain-02.webp » se retrouvait sur un tableau
+					// électrique (nom déduit de la section, pas du sujet) — beta #8.
+					`${slugify(slot.alt || slot.heading || "image")}-${String(idx + 1).padStart(2, "0")}`,
 					excerpt,
 					args.cross_site_unique === true,
 					args.no_character === true
@@ -1494,23 +1581,34 @@ async function runGenerateImage(args, progress) {
 			"I'll then generate it AND wire it straight into that spot. (For several at once: make_images.)",
 		].join("\n");
 	}
-	const slots = scanFileForSlots(pagePath, readFileSync(pagePath, "utf8"));
-	if (!slots.length) {
+	const pageContent = readFileSync(pagePath, "utf8");
+	const slots = scanFileForSlots(pagePath, pageContent);
+	// Emplacement cible de CETTE image, dans l'ordre :
+	//  1) le placeholder désigné par `placeholder` (fragment de son src/tag),
+	//  2) sinon une IMAGE DÉJÀ POSÉE désignée par `placeholder` → on l'ÉCRASE en
+	//     place (beta #7 : remplacer une image générique sans passer par edit_image),
+	//  3) sinon le 1er placeholder de la page.
+	let target = null;
+	let replacing = false;
+	if (args.placeholder) {
+		const frag = String(args.placeholder);
+		target =
+			slots.find((s) => s.src.includes(frag) || s.tag.includes(frag)) ?? null;
+		if (!target) {
+			target = findExistingImgByFragment(pagePath, pageContent, frag);
+			replacing = Boolean(target);
+		}
+	}
+	if (!target) {
+		target = slots[0] ?? null;
+	}
+	if (!target) {
 		return [
-			`⚠ No placeholder found on ${relative(projectDir, pagePath)} — nothing to fill, so I generated nothing (0 credits).`,
-			'Add a placeholder where you want the image →  <img src="https://placehold.co/1200x600" alt="…">  then call me again.',
+			`⚠ Nothing to fill on ${relative(projectDir, pagePath)}${args.placeholder ? ` matching "${args.placeholder}"` : ""} — I generated nothing (0 credits).`,
+			'Either add a placeholder where you want it →  <img src="https://placehold.co/1200x600" alt="…">  then call me again,',
+			'OR to REPLACE an existing image, pass placeholder:"<part of its filename, e.g. m-bakkali-01>".',
 		].join("\n");
 	}
-	// Emplacement cible : le placeholder désigné par `placeholder` (fragment de
-	// son src), sinon le 1er de la page. L'agent en met UN là où il veut CETTE image.
-	const target =
-		(args.placeholder
-			? slots.find(
-					(s) =>
-						s.src.includes(String(args.placeholder)) ||
-						s.tag.includes(String(args.placeholder))
-				)
-			: null) ?? slots[0];
 
 	const saveDir = args.save_dir
 		? resolveIn(projectDir, args.save_dir)
@@ -1591,7 +1689,7 @@ async function runGenerateImage(args, progress) {
 		out.style_inferred ? STYLE_INFERRED_NOTE : "",
 		out.reused
 			? `Image placed ✔ — reused customer "${out.reviewer}" (0 credits)`
-			: `Image generated + placed ✔ (${out.credits} credits)`,
+			: `Image ${replacing ? "regenerated + replaced in place" : "generated + placed"} ✔ (${out.credits} credits)`,
 		`wired into ${relative(projectDir, target.file)}  →  ${prefix}${fileName}`,
 		`size: ${out.image.width}×${out.image.height}${out.image.bytes ? ` — ${Math.round(out.image.bytes / 1024)} KB` : ""} (optimised WebP)`,
 		`alt: ${out.alt}`,
@@ -2805,7 +2903,7 @@ const TOOLS = [
 				max_images: {
 					type: "number",
 					description:
-						"Cap per run (default 10, max 20). For a page with MANY image slots, prefer batches of ~6: call make_images repeatedly with max_images:6 until dry_run shows 0 placeholders left. Small batches finish well under the time budget — fewer skipped tail images, no perceived timeout.",
+						"Cap per run (default 10, max 20). Leave it at the default for most pages. For a page with MANY slots, just raise it (up to 20) and call ONCE — if a few tail images get skipped to stay within the time budget, simply rerun the SAME call: already-wired images are skipped (0 extra credits), only the remaining slots generate. No need to micro-batch.",
 				},
 				save_dir: {
 					type: "string",
@@ -2859,7 +2957,7 @@ const TOOLS = [
 				placeholder: {
 					type: "string",
 					description:
-						"Optional: a fragment of the target placeholder's src/tag to pick WHICH one to fill (default: the first placeholder on the page).",
+						"Optional. A fragment of the target's src/tag to pick WHICH spot to fill (default: the first placeholder on the page). It can also point at an EXISTING real image (e.g. 'm-bakkali-01') to REGENERATE and REPLACE it in place — no need for edit_image to overwrite a previously generated/generic image.",
 				},
 				public_prefix: {
 					type: "string",
@@ -3435,7 +3533,7 @@ async function handle(msg) {
 				serverInfo: {
 					name: "distribea-mcp",
 					title: "Distribea MCP",
-					version: "1.9.0",
+					version: "1.11.0",
 				},
 				instructions: INSTRUCTIONS,
 			},
