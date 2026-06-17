@@ -19,8 +19,10 @@ A plain landing page, dressed with on-brand product imagery in a single
 `make_images` call — no stock photos, no placeholders:
 
 <p align="center">
-  <img src="https://distribea-categories-images.fra1.cdn.digitaloceanspaces.com/mcp/distribea-before-after.gif" width="390" alt="Before / after: a landing page dressed with on-brand images by the Distribea MCP" />
+  <img src="https://distribea-categories-images.fra1.cdn.digitaloceanspaces.com/mcp/distribea-before-after-en.gif" width="390" alt="With / without the MCP: a landing page dressed with on-brand images by the Distribea MCP" />
 </p>
+
+> **A/B test:** same prompt, same reference image, same LLM model.
 
 ## Setup
 

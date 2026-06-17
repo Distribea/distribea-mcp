@@ -3965,7 +3965,15 @@ async function planPage(projectDir, pagePath) {
 // --- #7 Sites 100% composants : suivre les imports LOCAUX d'une page ----------
 const IMPORT_FROM_RE = /(?:import|export)\b[^;]*?\bfrom\s*['"](\.[^'"]+)['"]/g;
 const IMPORT_CALL_RE = /\bimport\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g;
-const IMPORT_TRY_EXTS = [".tsx", ".jsx", ".vue", ".svelte", ".astro", ".html", ".htm"];
+const IMPORT_TRY_EXTS = [
+	".tsx",
+	".jsx",
+	".vue",
+	".svelte",
+	".astro",
+	".html",
+	".htm",
+];
 const BRINGALIVE_MAX_IMPORTS = 25;
 
 // Résout un import relatif vers un VRAI fichier de page/composant scannable
