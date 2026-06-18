@@ -1,13 +1,19 @@
 # Distribea MCP
 
-On-brand website imagery, generated straight into your codebase.
+> Brand-aware image generation MCP, powered by Nano Banana Pro — define your
+> brand once, every image ships on-brand and production-ready (WebP, SEO alt
+> text, placed in your repo). Works with Claude Code, Cursor, Windsurf, Replit,
+> Copilot.
 
-Plug this MCP into your coding tool (Claude Code, Cursor…) and every page you
-build ships with **ultra-realistic, style-locked images**: one consistent art
-direction across the whole site, recurring characters with the **same face in
-every scene**, believable UGC-style avatars for review sections, plus logo,
-favicon pack and og:image, all delivered as optimised WebP with proper ALT
-text, patched directly into your code.
+Define your brand **once** — art direction, colours, recurring faces, products —
+and every page you build ships with on-brand imagery **by default**: one
+consistent look across the whole site, recurring characters with the **same face
+in every scene**, believable UGC-style avatars for review sections. The engine
+runs on **Nano Banana Pro**.
+
+Each image lands production-ready: optimised **WebP**, proper **SEO alt text**,
+and **patched straight into your code** — no stock photos, no placeholders, no
+manual export step.
 
 The heavy lifting (art direction, generation, billing) runs on the hosted
 Distribea engine. This package is only the local connector: it scans and
