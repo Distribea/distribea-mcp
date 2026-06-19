@@ -7,6 +7,7 @@
 [![npm version](https://img.shields.io/npm/v/distribea-mcp?color=2563eb&label=npm)](https://www.npmjs.com/package/distribea-mcp)
 [![npm downloads](https://img.shields.io/npm/dm/distribea-mcp?color=2563eb)](https://www.npmjs.com/package/distribea-mcp)
 [![MCP registry](https://img.shields.io/badge/MCP-registry-2563eb)](https://registry.modelcontextprotocol.io)
+[![License: MIT](https://img.shields.io/badge/License-MIT-2563eb)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/Distribea/distribea-mcp?style=social)](https://github.com/Distribea/distribea-mcp/stargazers)
 
 **Works with Claude Code · Cursor · Windsurf · Replit · Copilot**

@@ -1,6 +1,6 @@
 {
   "name": "distribea-mcp",
-  "version": "1.13.5",
+  "version": "1.13.6",
   "mcpName": "io.github.Distribea/distribea-mcp",
   "description": "Brand-aware image generation MCP, powered by Nano Banana Pro — define your brand once, every image ships on-brand and production-ready (WebP, SEO alt text, placed in your repo). Works with Claude Code, Cursor, Windsurf, Replit, Copilot.",
   "type": "module",
@@ -9,7 +9,8 @@
   },
   "files": [
     "index.mjs",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=18.17"
@@ -32,7 +33,7 @@
   ],
   "author": "Distribea",
   "homepage": "https://distribea.com",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "publishConfig": {
     "access": "public"
   },
