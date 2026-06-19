@@ -25,7 +25,9 @@ A plain landing page, dressed with on-brand product imagery in a single
 `make_images` call — no stock photos, no placeholders:
 
 <p align="center">
-  <img src="https://distribea-categories-images.fra1.cdn.digitaloceanspaces.com/mcp/distribea-before-after-montage.webp" width="760" alt="The same Feastables landing page, side by side: without the MCP (raw photos, empty sections) versus with the MCP (on-brand imagery in every slot from a single make_images call)" />
+  <img src="https://distribea-categories-images.fra1.cdn.digitaloceanspaces.com/mcp/distribea-before-after-en.gif" width="380" alt="A sneaker store landing page animating from without the MCP (raw photos) to with the MCP (on-brand product imagery)" />
+  &nbsp;
+  <img src="https://distribea-categories-images.fra1.cdn.digitaloceanspaces.com/mcp/distribea-before-after-feastables.gif" width="380" alt="A chocolate brand landing page animating from without the MCP (raw photos, empty sections) to with the MCP (on-brand imagery in every slot)" />
 </p>
 
 > **A/B test:** same prompt, same reference image, same LLM model.
