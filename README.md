@@ -25,9 +25,7 @@ A plain landing page, dressed with on-brand product imagery in a single
 `make_images` call — no stock photos, no placeholders:
 
 <p align="center">
-  <video src="https://github.com/Distribea/distribea-mcp/releases/download/demo-media/distribea-mcp-demo.mp4" controls muted loop width="390">
-    <a href="https://github.com/Distribea/distribea-mcp/releases/download/demo-media/distribea-mcp-demo.mp4">Watch the demo</a>
-  </video>
+  <img src="https://distribea-categories-images.fra1.cdn.digitaloceanspaces.com/mcp/distribea-before-after-en.gif" width="390" alt="With / without the MCP: a landing page dressed with on-brand images by the Distribea MCP" />
 </p>
 
 > **A/B test:** same prompt, same reference image, same LLM model.
