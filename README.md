@@ -15,7 +15,7 @@
 </div>
 
 <p align="center">
-  <img src="https://distribea-categories-images.fra1.cdn.digitaloceanspaces.com/mcp/distribea-before-after-showcase.gif" width="820" alt="Two landing pages, a sneaker store and a chocolate brand, shown full-page side by side, animating in sync from without the MCP to with the MCP, every image slot filled on-brand" />
+  <img src="https://distribea-categories-images.fra1.cdn.digitaloceanspaces.com/mcp/distribea-before-after-showcase-v2.gif" width="820" alt="Two landing pages, a sneaker store and a chocolate brand, shown full-page side by side, animating in sync from without the MCP to with the MCP, every image slot filled on-brand" />
 </p>
 
 <div align="center">
