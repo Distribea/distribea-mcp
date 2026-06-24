@@ -29,7 +29,7 @@ import {
 } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
 	basename,
 	dirname,
@@ -44,11 +44,44 @@ import { createInterface } from "node:readline";
 // stdout est le canal protocole — TOUT log humain part sur stderr.
 const logErr = (...a) => process.stderr.write(`${a.join(" ")}\n`);
 
-const TOKEN = process.env.DISTRIBEA_MCP_KEY ?? process.env.SITEPACK_TOKEN ?? "";
+// --- mode CLI vs MCP --------------------------------------------------------
+// Le MÊME binaire sert les deux usages : appelé sans argument par un client MCP
+// (transport stdio JSON-RPC, stdin = un tuyau), ou tapé à la main dans un
+// terminal (`distribea image "…"`). On bascule en CLI dès qu'il y a un argument
+// OU qu'un vrai terminal humain est branché sur l'entrée.
+const CLI_ARGS = process.argv.slice(2);
+const IS_CLI = CLI_ARGS.length > 0 || Boolean(process.stdin.isTTY);
+
+// Réglages mémorisés par `distribea login` (~/.distribea/config.json) — lus en
+// repli quand les variables d'environnement ne sont pas posées (usage CLI).
+const CLI_CONFIG_DIR = join(homedir(), ".distribea");
+const CLI_CONFIG_PATH = join(CLI_CONFIG_DIR, "config.json");
+function readCliConfig() {
+	try {
+		if (existsSync(CLI_CONFIG_PATH)) {
+			return JSON.parse(readFileSync(CLI_CONFIG_PATH, "utf8")) ?? {};
+		}
+	} catch {
+		// config illisible = on l'ignore proprement
+	}
+	return {};
+}
+const CLI_CONFIG = readCliConfig();
+
+const TOKEN =
+	process.env.DISTRIBEA_MCP_KEY ??
+	process.env.SITEPACK_TOKEN ??
+	CLI_CONFIG.key ??
+	"";
 const APP_URL = (
-	process.env.DISTRIBEA_APP_URL ?? "https://distribea.com"
+	process.env.DISTRIBEA_APP_URL ??
+	CLI_CONFIG.app_url ??
+	"https://distribea.com"
 ).replace(/\/+$/, "");
-if (!TOKEN) {
+// En MCP (stdio) la clé est obligatoire au démarrage. En CLI on laisse passer :
+// `distribea login/help/version` doivent marcher sans clé, et chaque commande
+// qui en a besoin le signale elle-même proprement.
+if (!(TOKEN || IS_CLI)) {
 	logErr(
 		"FATAL: DISTRIBEA_MCP_KEY manquante. Récupère ton bloc de connexion sur /account/mcp."
 	);
@@ -435,6 +468,13 @@ async function callEngine(op, projectKey, payload = {}) {
 			if (data.gift && typeof data.gift.remaining === "number") {
 				LAST_GIFT = data.gift;
 			}
+			return data;
+		}
+		// Rejet DOUX (HTTP 2xx + ok:false) : aujourd'hui seul generate_raw le
+		// produit — modèle / qualité / format invalide. Ce n'est PAS une panne :
+		// on renvoie le corps tel quel (avec ses options valides) pour que l'outil
+		// guide le client, au lieu de lever. Rien n'a été produit ni débité.
+		if (res.ok && data && data.ok === false) {
 			return data;
 		}
 		if (res.status === 401) {
@@ -1956,6 +1996,559 @@ async function runGenerateImage(args, progress) {
 		.join("\n");
 }
 
+// --- palette manuelle : choisir un modèle + générer au PRIX DU SITE -----------
+// Mode AVANCÉ (Ocean 2026-06-22) : la télécommande expose le MÊME catalogue que
+// la barre de création du site et génère avec le modèle + les réglages choisis,
+// facturé au prix du site (sans la marge MCP). Le robot auto (generate_image /
+// make_images) reste le défaut quand le client ne choisit rien.
+
+// Rejet DOUX du moteur (mauvais modèle / qualité / format) : pas une panne — on
+// présente le motif + les options valides pour que le client se corrige seul.
+function softRejectText(out) {
+	const parts = [String(out.message ?? "Invalid request.")];
+	if (Array.isArray(out.valid_models)) {
+		parts.push("", `Valid models: ${out.valid_models.join(", ")}`);
+	}
+	if (Array.isArray(out.valid_qualities)) {
+		parts.push("", `Valid qualities: ${out.valid_qualities.join(", ")}`);
+	}
+	if (Array.isArray(out.valid_formats)) {
+		parts.push("", `Valid formats: ${out.valid_formats.join(", ")}`);
+	}
+	return parts.join("\n");
+}
+
+async function runListModels(args) {
+	const projectDir = resolveIn(
+		process.cwd(),
+		args.project_dir ?? process.cwd()
+	);
+	const out = await engine("list_models", projectDir, {});
+	const models = Array.isArray(out.models) ? out.models : [];
+	if (models.length === 0) {
+		return "No image models are available right now.";
+	}
+	const lines = models.map((m) => {
+		const price =
+			typeof m.priceCredits === "number" ? `${m.priceCredits} cr` : "—";
+		const quality = m.qualities?.length
+			? ` · quality ${m.qualities.join("/")}`
+			: "";
+		const formats = m.formats?.length ? ` · ${m.formats.join(",")}` : "";
+		const copies = m.maxImages > 1 ? ` · up to ${m.maxImages}/call` : "";
+		return `• ${m.id} — ${m.label}${m.tagline ? ` (${m.tagline})` : ""} — from ${price}/image${quality}${formats}${copies}`;
+	});
+	return [
+		"Image models you can pick (pass the id to generate_with_model):",
+		"",
+		...lines,
+		"",
+		"Prices are in credits; models billed by size show a starting price (it rises with quality/number).",
+	].join("\n");
+}
+
+// http(s) → URL de référence passée telle quelle.
+const HTTP_REF_RE = /^https?:\/\//i;
+
+// Attache une OU PLUSIEURS images de référence (i2i / i2v) au payload : URLs http
+// telles quelles ; fichiers ou presse-papier ("clipboard") lus en data URI. En
+// DEVIS on ne lit pas les fichiers (marqueur). `single` = arg image ; `multi` =
+// arg images (liste). Le moteur plafonne au max du modèle.
+async function attachRefImages(payload, projectDir, single, multi, isDry) {
+	const items = [];
+	if (single) {
+		items.push(String(single));
+	}
+	if (Array.isArray(multi)) {
+		for (const m of multi) {
+			if (m) {
+				items.push(String(m));
+			}
+		}
+	}
+	const urls = [];
+	const b64 = [];
+	for (const raw of items) {
+		const s = raw.trim();
+		if (!s) {
+			continue;
+		}
+		if (HTTP_REF_RE.test(s)) {
+			urls.push(s);
+		} else if (isDry) {
+			urls.push("ref://pending");
+		} else {
+			b64.push(await imageArgToDataUri(projectDir, s));
+		}
+	}
+	if (urls.length > 0) {
+		payload.image_urls = urls;
+	}
+	if (b64.length > 0) {
+		payload.image_base64_list = b64;
+	}
+}
+
+async function runGenerateWithModel(args, progress) {
+	// model optionnel : si absent, le moteur applique le défaut (nano-banana-pro 2K).
+	const model = String(args.model ?? "").trim();
+	const subject = String(args.subject ?? args.prompt ?? "").trim();
+	if (!subject) {
+		return 'The "subject" parameter is required (describe the image you want).';
+	}
+	const projectDir = resolveIn(
+		process.cwd(),
+		args.project_dir ?? process.cwd()
+	);
+	// Format de fichier livré : png par défaut, jpg si demandé. JAMAIS de WebP —
+	// ce produit livre le format natif de génération, distinct du builder de site.
+	const fileType = String(args.file_type ?? "png")
+		.toLowerCase()
+		.startsWith("jp")
+		? "jpg"
+		: "png";
+	const payload = {
+		model,
+		subject,
+		quality: args.quality,
+		format: args.format,
+		count: args.count,
+		file_type: fileType,
+	};
+	// Image(s) de référence (image-to-image) : une ou plusieurs selon le modèle.
+	await attachRefImages(
+		payload,
+		projectDir,
+		args.image,
+		args.images,
+		args.dry_run
+	);
+
+	// PREVIEW (dry_run) : devis EXACT du moteur (prix du site) — 0 image, 0 crédit.
+	if (args.dry_run) {
+		const q = await engine("generate_raw", projectDir, {
+			...payload,
+			dry_run: true,
+		});
+		if (q.ok === false) {
+			return softRejectText(q);
+		}
+		return [
+			`Preview — ${q.model}: ${q.count} image(s), ${q.quality ?? "default"} quality, ${q.format ?? "default"} format, ${q.file_type ?? fileType} file.`,
+			`🧾 Estimate: ≈ ${q.credits} credits (site price). Run again without dry_run to generate.`,
+		].join("\n");
+	}
+
+	progress?.(`🎨 Generating with ${model} at site price (30-60 s)…`, 0, 1);
+	const out = await engine("generate_raw", projectDir, {
+		...payload,
+		client_ref: "generate_with_model",
+	});
+	if (out.ok === false) {
+		return softRejectText(out);
+	}
+	const images = Array.isArray(out.images) ? out.images : [];
+	if (images.length === 0) {
+		return "No image was produced (0 credits).";
+	}
+
+	// Produit « image au choix » : on TÉLÉCHARGE chaque image au FORMAT NATIF
+	// (png/jpg) dans un dossier rangé du projet, sans JAMAIS écraser un fichier
+	// existant (les versions précédentes sont conservées, suffixe -2/-3…).
+	const outDir = resolveIn(
+		projectDir,
+		String(args.out_dir ?? "distribea-images")
+	);
+	const lines = [];
+	let i = 0;
+	for (const im of images) {
+		i += 1;
+		const ext = String(im.format ?? fileType).replace("jpeg", "jpg");
+		const base = `${slugify(subject)}${images.length > 1 ? `-${i}` : ""}`;
+		const fileName = uniqueFileName(outDir, base, ext);
+		await saveUrl(im.cdn_url, join(outDir, fileName));
+		lines.push(
+			`• ${relative(projectDir, join(outDir, fileName))}  (${im.width}×${im.height}, ${ext})`
+		);
+	}
+	const header = `${images.length} image${images.length > 1 ? "s" : ""} generated with ${out.model} ✔ (${out.credits} credits${typeof out.balance === "number" ? `, balance ${out.balance}` : ""})`;
+	return [
+		header,
+		`Downloaded (native ${fileType}) to ${relative(projectDir, outDir) || "."}/`,
+		...lines,
+	].join("\n");
+}
+
+// Nom de fichier libre dans un dossier : jamais d'écrasement — si « base.ext »
+// existe déjà, on essaie base-2.ext, base-3.ext… (on garde les versions).
+function uniqueFileName(dir, base, ext) {
+	let name = `${base}.${ext}`;
+	let n = 1;
+	while (existsSync(join(dir, name))) {
+		n += 1;
+		name = `${base}-${n}.${ext}`;
+	}
+	return name;
+}
+
+// --- palette VIDÉO : choisir un modèle + générer au PRIX DU SITE ---------------
+// Transposition de generate_with_model (Ocean 2026-06-23). Même produit distinct
+// (fichier téléchargé, pas posé dans une page), mais en VIDÉO : la fabrication est
+// LONGUE (plusieurs minutes) → on relance le même appel jusqu'à livraison (le
+// moteur reconnecte sans jamais re-débiter).
+
+function softRejectVideo(out) {
+	const parts = [String(out.message ?? "Invalid request.")];
+	if (Array.isArray(out.valid_models)) {
+		parts.push("", `Valid models: ${out.valid_models.join(", ")}`);
+	}
+	if (Array.isArray(out.valid_resolutions)) {
+		parts.push("", `Valid resolutions: ${out.valid_resolutions.join(", ")}`);
+	}
+	if (Array.isArray(out.valid_durations)) {
+		parts.push("", `Valid durations (s): ${out.valid_durations.join(", ")}`);
+	}
+	if (Array.isArray(out.valid_formats)) {
+		parts.push("", `Valid formats: ${out.valid_formats.join(", ")}`);
+	}
+	return parts.join("\n");
+}
+
+async function runListVideoModels(args) {
+	const projectDir = resolveIn(
+		process.cwd(),
+		args.project_dir ?? process.cwd()
+	);
+	const out = await engine("list_video_models", projectDir, {});
+	const models = Array.isArray(out.models) ? out.models : [];
+	if (models.length === 0) {
+		return "No video models are available right now.";
+	}
+	const lines = models.map((m) => {
+		const price =
+			typeof m.priceCredits === "number" ? `${m.priceCredits} cr` : "—";
+		const dur = m.durations?.length
+			? ` · ${m.durations[0]}-${m.durations.at(-1)}s`
+			: "";
+		const res = m.resolutions?.length ? ` · ${m.resolutions.join("/")}` : "";
+		const fmt = m.formats?.length ? ` · ${m.formats.join(",")}` : "";
+		return `• ${m.id} — ${m.label}${m.tagline ? ` (${m.tagline})` : ""} — from ${price}${dur}${res}${fmt}`;
+	});
+	return [
+		"Video models you can pick (pass the id to generate_video):",
+		"",
+		...lines,
+		"",
+		"Price shown is for the default duration — it rises with longer clips. Video needs a paid plan (no free video).",
+	].join("\n");
+}
+
+async function runGenerateVideo(args, progress) {
+	// model optionnel : si absent, le moteur applique le défaut (grok 6s 720p).
+	const model = String(args.model ?? "").trim();
+	const subject = String(args.subject ?? args.prompt ?? "").trim();
+	if (!subject) {
+		return 'The "subject" parameter is required (describe the video you want).';
+	}
+	const projectDir = resolveIn(
+		process.cwd(),
+		args.project_dir ?? process.cwd()
+	);
+	const payload = {
+		model,
+		subject,
+		duration: args.duration,
+		resolution: args.resolution,
+		format: args.format,
+	};
+	// Image(s) de DÉPART (image-to-video) — une ou plusieurs selon le modèle.
+	await attachRefImages(
+		payload,
+		projectDir,
+		args.image,
+		args.images,
+		args.dry_run
+	);
+
+	// PREVIEW (dry_run) : devis EXACT (prix du site) — 0 vidéo, 0 crédit.
+	if (args.dry_run) {
+		const q = await engine("generate_video", projectDir, {
+			...payload,
+			dry_run: true,
+		});
+		if (q.ok === false) {
+			return softRejectVideo(q);
+		}
+		return [
+			`Preview — ${q.model}: ${q.duration_seconds}s, ${q.resolution ?? "default"} resolution, ${q.format ?? "default"} format.`,
+			`🧾 Estimate: ≈ ${q.credits} credits (site price, longer = more). Run again without dry_run to generate.`,
+		].join("\n");
+	}
+
+	// La vidéo est ASYNCHRONE (plusieurs minutes). On relance le MÊME appel : le
+	// moteur reconnecte au job déjà payé (jamais de double-débit) et livre dès que
+	// c'est prêt. Au-delà du budget client, on rend la main avec un message clair.
+	progress?.(
+		`🎬 Rendering video with ${model} (can take a few minutes)…`,
+		0,
+		1
+	);
+	const startedAt = Date.now();
+	const POLL_BUDGET_MS = 230_000;
+	const PENDING_RE = /being produced|still being|glitch|in progress|rerun/i;
+	let out = null;
+	for (;;) {
+		try {
+			out = await engine("generate_video", projectDir, {
+				...payload,
+				client_ref: "generate_video",
+			});
+			break;
+		} catch (e) {
+			const pending = PENDING_RE.test(e?.message ?? "");
+			if (pending && Date.now() - startedAt < POLL_BUDGET_MS) {
+				progress?.("🎬 Still rendering…", 1, 1);
+				await delay(12_000);
+			} else if (pending) {
+				return "🎬 Your video is still rendering (this model takes a few minutes). Run generate_video again with the SAME settings in ~1 min to pick it up — you won't be charged twice.";
+			} else {
+				throw e;
+			}
+		}
+	}
+	if (out.ok === false) {
+		return softRejectVideo(out);
+	}
+	const v = out.video;
+	if (!v?.cdn_url) {
+		return "No video was produced (0 credits).";
+	}
+
+	const outDir = resolveIn(
+		projectDir,
+		String(args.out_dir ?? "distribea-videos")
+	);
+	const fileName = uniqueFileName(outDir, slugify(subject), "mp4");
+	await saveUrl(v.cdn_url, join(outDir, fileName));
+	const mb = v.bytes ? `${(v.bytes / 1_048_576).toFixed(1)} MB` : "";
+	return [
+		`Video generated with ${out.model} ✔ (${out.credits} credits${typeof out.balance === "number" ? `, balance ${out.balance}` : ""})`,
+		`Downloaded (${v.duration_seconds}s mp4) to ${relative(projectDir, outDir) || "."}/`,
+		`• ${relative(projectDir, join(outDir, fileName))}${mb ? `  (${mb})` : ""}`,
+	].join("\n");
+}
+
+// --- palette AUDIO : musique + voix au PRIX DU SITE ---------------------------
+// Même produit distinct (fichier téléchargé) et même gestion d'attente que la
+// vidéo. Musique = prompt + durée. Voix = texte + voix + langue.
+
+// « média encore en fabrication » (async) → on reboucle.
+const MEDIA_PENDING_RE = /being produced|still being|glitch|in progress|rerun/i;
+
+function softRejectAudio(out) {
+	const parts = [String(out.message ?? "Invalid request.")];
+	if (Array.isArray(out.valid_models)) {
+		parts.push("", `Valid models: ${out.valid_models.join(", ")}`);
+	}
+	if (Array.isArray(out.valid_durations)) {
+		parts.push("", `Valid durations (s): ${out.valid_durations.join(", ")}`);
+	}
+	if (Array.isArray(out.valid_languages)) {
+		parts.push("", `Valid languages: ${out.valid_languages.join(", ")}`);
+	}
+	if (Array.isArray(out.valid_voices)) {
+		parts.push("", `Example voices: ${out.valid_voices.join(", ")}`);
+	}
+	return parts.join("\n");
+}
+
+// Poll commun (audio long) : relance le même appel jusqu'à livraison ou budget.
+async function pollMediaGen(op, projectDir, payload, progress, label) {
+	progress?.(`${label}…`, 0, 1);
+	const startedAt = Date.now();
+	const POLL_BUDGET_MS = 230_000;
+	for (;;) {
+		try {
+			return await engine(op, projectDir, { ...payload, client_ref: op });
+		} catch (e) {
+			const pending = MEDIA_PENDING_RE.test(e?.message ?? "");
+			if (pending && Date.now() - startedAt < POLL_BUDGET_MS) {
+				progress?.(`${label} (still rendering)…`, 1, 1);
+				await delay(8000);
+			} else if (pending) {
+				return { __pending: true };
+			} else {
+				throw e;
+			}
+		}
+	}
+}
+
+// Télécharge l'audio livré (mp3/wav) dans un dossier rangé, sans écraser.
+async function deliverAudioFile(out, projectDir, args, nameHint, defaultDir) {
+	const a = out.audio;
+	if (!a?.cdn_url) {
+		return "No audio was produced (0 credits).";
+	}
+	const outDir = resolveIn(projectDir, String(args.out_dir ?? defaultDir));
+	const ext = String(a.format || "mp3").replace("mpeg", "mp3");
+	const fileName = uniqueFileName(outDir, slugify(nameHint) || "audio", ext);
+	await saveUrl(a.cdn_url, join(outDir, fileName));
+	const kb = a.bytes ? `${Math.round(a.bytes / 1024)} KB` : "";
+	return [
+		`${out.model} ✔ (${out.credits} credits${typeof out.balance === "number" ? `, balance ${out.balance}` : ""}) — ${a.detail ?? ""}`,
+		`Downloaded to ${relative(projectDir, outDir) || "."}/`,
+		`• ${relative(projectDir, join(outDir, fileName))}${kb ? `  (${kb})` : ""}`,
+	].join("\n");
+}
+
+async function runListMusicModels(args) {
+	const projectDir = resolveIn(
+		process.cwd(),
+		args.project_dir ?? process.cwd()
+	);
+	const out = await engine("list_music_models", projectDir, {});
+	const models = Array.isArray(out.models) ? out.models : [];
+	if (models.length === 0) {
+		return "No music models are available right now.";
+	}
+	const lines = models.map((m) => {
+		const price =
+			typeof m.priceCredits === "number" ? `${m.priceCredits} cr` : "—";
+		return `• ${m.id} — ${m.label}${m.tagline ? ` (${m.tagline})` : ""} — from ${price}`;
+	});
+	return [
+		"Music models you can pick (pass the id to generate_music):",
+		"",
+		...lines,
+		"",
+		"Music needs a paid plan (no free audio).",
+	].join("\n");
+}
+
+async function runGenerateMusic(args, progress) {
+	// model optionnel : si absent, le moteur applique le défaut (MiniMax Music).
+	const model = String(args.model ?? "").trim();
+	const subject = String(args.subject ?? args.prompt ?? "").trim();
+	if (!subject) {
+		return 'The "subject" parameter is required (describe the music: style, mood, instruments).';
+	}
+	const projectDir = resolveIn(
+		process.cwd(),
+		args.project_dir ?? process.cwd()
+	);
+	const payload = { model, subject, duration: args.duration };
+
+	if (args.dry_run) {
+		const q = await engine("generate_music", projectDir, {
+			...payload,
+			dry_run: true,
+		});
+		if (q.ok === false) {
+			return softRejectAudio(q);
+		}
+		return [
+			`Preview — ${q.model}: ${q.detail}.`,
+			`🧾 Estimate: ≈ ${q.credits} credits (site price). Run again without dry_run to generate.`,
+		].join("\n");
+	}
+
+	const out = await pollMediaGen(
+		"generate_music",
+		projectDir,
+		payload,
+		progress,
+		`🎵 Composing music with ${model || "MiniMax Music"}`
+	);
+	if (out.__pending) {
+		return "🎵 Your music is still rendering. Run generate_music again with the SAME settings in ~1 min to pick it up — you won't be charged twice.";
+	}
+	if (out.ok === false) {
+		return softRejectAudio(out);
+	}
+	return deliverAudioFile(out, projectDir, args, subject, "distribea-music");
+}
+
+async function runListVoiceModels(args) {
+	const projectDir = resolveIn(
+		process.cwd(),
+		args.project_dir ?? process.cwd()
+	);
+	const out = await engine("list_voice_models", projectDir, {});
+	const models = Array.isArray(out.models) ? out.models : [];
+	if (models.length === 0) {
+		return "No voice models are available right now.";
+	}
+	const lines = models.map((m) => {
+		const price =
+			typeof m.priceCredits === "number"
+				? `~${m.priceCredits} cr/500 chars`
+				: "—";
+		const langs = m.languages?.length ? ` · ${m.languages.length} langs` : "";
+		const voices = m.voiceCount ? ` · ${m.voiceCount} voices` : "";
+		const ex = m.sampleVoices?.length
+			? `\n    e.g. ${m.sampleVoices.map((v) => `${v.id} (${v.gender})`).join(", ")}`
+			: "";
+		return `• ${m.id} — ${m.label}${m.tagline ? ` (${m.tagline})` : ""} — ${price}${langs}${voices}${ex}`;
+	});
+	return [
+		"Voice models you can pick (pass the id to generate_voice):",
+		"",
+		...lines,
+		"",
+		"Pass a voice id + a language (see above). Voice needs a paid plan.",
+	].join("\n");
+}
+
+async function runGenerateVoice(args, progress) {
+	// model optionnel : si absent, le moteur applique le défaut (ElevenLabs, voix Roger).
+	const model = String(args.model ?? "").trim();
+	const text = String(args.text ?? args.subject ?? args.prompt ?? "").trim();
+	if (!text) {
+		return 'The "text" parameter is required (the words the voice should read).';
+	}
+	const projectDir = resolveIn(
+		process.cwd(),
+		args.project_dir ?? process.cwd()
+	);
+	const payload = { model, text, voice: args.voice, language: args.language };
+
+	if (args.dry_run) {
+		const q = await engine("generate_voice", projectDir, {
+			...payload,
+			dry_run: true,
+		});
+		if (q.ok === false) {
+			return softRejectAudio(q);
+		}
+		return [
+			`Preview — ${q.model}: ${q.detail}.`,
+			`🧾 Estimate: ≈ ${q.credits} credits (site price, per character). Run again without dry_run to generate.`,
+		].join("\n");
+	}
+
+	const out = await pollMediaGen(
+		"generate_voice",
+		projectDir,
+		payload,
+		progress,
+		`🎙️ Synthesizing voice with ${model || "ElevenLabs"}`
+	);
+	if (out.__pending) {
+		return "🎙️ Your voice-over is still rendering. Run generate_voice again with the SAME settings in ~1 min to pick it up — you won't be charged twice.";
+	}
+	if (out.ok === false) {
+		return softRejectAudio(out);
+	}
+	return deliverAudioFile(
+		out,
+		projectDir,
+		args,
+		text.slice(0, 60),
+		"distribea-voice"
+	);
+}
+
 // --- blog cover ---------------------------------------------------------------
 const ARTICLE_UA =
 	"Mozilla/5.0 (compatible; DistribeaImages/1.0; +https://distribea.com)";
@@ -3373,7 +3966,7 @@ const TOOLS = [
 			openWorldHint: true,
 		},
 		description:
-			'Generate ONE website image for a SPECIFIC spot AND wire it straight into the page — coherent with the locked style (and optionally a recurring character/product). Generation is tied to a placement: pass page_path + leave a placeholder (<img src="https://placehold.co/…">) where you want it; the image replaces that placeholder. NO page / NO placeholder = NOTHING is generated and NOTHING is billed (never produces an orphan image). Subjects mentioning a customer review/testimonial/avatar automatically switch to the UGC mode: ultra-real casual smartphone selfie of an everyday person (unique per site, same reviewer = same face). For a whole page or project, prefer make_images.',
+			'Generate ONE website image for a SPECIFIC spot AND wire it straight into the page — DESTINATION = a page (placed in code), NOT a file on disk. Coherent with the locked style (and optionally a recurring character/product). Generation is tied to a placement: pass page_path + leave a placeholder (<img src="https://placehold.co/…">) where you want it; the image replaces that placeholder. NO page / NO placeholder = NOTHING is generated and NOTHING is billed (never produces an orphan image). Subjects mentioning a customer review/testimonial/avatar automatically switch to the UGC mode: ultra-real casual smartphone selfie of an everyday person (unique per site, same reviewer = same face). For a whole page or project, prefer make_images. CONTEXT: when you are building or editing a website (pages, components, placeholders), THIS or make_images is the default — that is the page-building job. If the user instead wants a downloadable image FILE to keep/reuse (an ad, a social/marketing visual, "download/save the png", a named model with no page), use generate_with_model. If it is unclear whether the image goes IN a page or is a downloaded FILE, ask one short question first.',
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -3440,6 +4033,327 @@ const TOOLS = [
 				},
 			},
 			required: ["subject"],
+		},
+	},
+	{
+		name: "list_models",
+		title: "List the image models the user can pick",
+		annotations: {
+			readOnlyHint: true,
+			destructiveHint: false,
+			openWorldHint: false,
+		},
+		description:
+			"Returns the catalog of image models to choose from: id, name, what it's best at, quality tiers, formats, max images per call, and an indicative price in credits. Call this BEFORE generate_with_model when the user wants to pick a specific model or compare options/prices. Image only for now.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				project_dir: {
+					type: "string",
+					description:
+						"Absolute path of the website project (default: current directory).",
+				},
+			},
+		},
+	},
+	{
+		name: "generate_with_model",
+		title: "Generate an image with a chosen model + settings",
+		annotations: {
+			readOnlyHint: false,
+			destructiveHint: false,
+			openWorldHint: true,
+		},
+		description:
+			"Standalone image generator — DESTINATION = a FILE on the user's disk, never a website page. Use it for downloadable assets the user keeps or reuses elsewhere: ads, social posts, marketing/promo visuals, thumbnails, a reusable hero or logo, or any 'generate then download / save to a folder' request (often with a named model like Flux Pro / Seedream, or a png/jpg format). DESTINATION ALWAYS WINS: if the image must appear ON a website page — or you are MID-BUILD of a site, filling placeholders / dressing pages — use generate_image (one spot) or make_images (whole page), EVEN IF a model is named. If it is genuinely unclear whether the user wants the image IN a page or as a downloaded FILE, ASK one short question before generating — do NOT guess. Downloads a NATIVE png/jpg (never WebP) into a tidy folder, at the regular SITE price; nothing is placed into any page. Get model ids from list_models. DEFAULT when the user names NO model: nano-banana-pro at 2K. ORIENTATION: if the user didn't state one, ASK 'portrait or landscape?' before generating, then pass the matching format (16:9 = landscape, 9:16 = portrait). (Same idea as Higgsfield: pick a model, dial settings, download the file.)",
+		inputSchema: {
+			type: "object",
+			properties: {
+				model: {
+					type: "string",
+					description:
+						'Optional model id from list_models, e.g. "flux-2.0-pro". If omitted, defaults to nano-banana-pro at 2K.',
+				},
+				subject: {
+					type: "string",
+					description: "What the image shows (the prompt).",
+				},
+				image: {
+					type: "string",
+					description:
+						'Optional reference image for image-to-image: a local file path, "clipboard" (a pasted image), or a public https URL. The result is generated FROM this image. Only models that support image-to-image accept it.',
+				},
+				images: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						'Optional MULTIPLE reference images (file paths, "clipboard", or https URLs) for models that accept several. Automatically capped to the model\'s max (see list_models). Use this OR image.',
+				},
+				quality: {
+					type: "string",
+					description:
+						'Optional quality tier, e.g. "1K"/"2K"/"4K" (see list_models). Ignored when the model has a fixed native size.',
+				},
+				format: {
+					type: "string",
+					description:
+						'Optional aspect ratio, e.g. "16:9", "1:1", "9:16" (see list_models for what the model supports).',
+				},
+				count: {
+					type: "integer",
+					description:
+						"Optional number of images (1..max for the model, see list_models). Default 1. Free/trial accounts are limited to 1.",
+				},
+				file_type: {
+					type: "string",
+					enum: ["png", "jpg"],
+					description:
+						"Downloaded file format. 'png' (default, lossless) or 'jpg' (smaller). Never WebP.",
+				},
+				out_dir: {
+					type: "string",
+					description:
+						"Folder to download the image(s) into (default 'distribea-images'). Files are named after the subject and never overwrite an existing file.",
+				},
+				project_dir: {
+					type: "string",
+					description:
+						"Absolute path of the project root (default: current directory). out_dir is resolved inside it.",
+				},
+				dry_run: {
+					type: "boolean",
+					description:
+						"PREVIEW mode: shows the exact site price + settings and generates NOTHING (0 credit).",
+				},
+			},
+			required: ["subject"],
+		},
+	},
+	{
+		name: "list_video_models",
+		title: "List the video models the user can pick",
+		annotations: {
+			readOnlyHint: true,
+			destructiveHint: false,
+			openWorldHint: false,
+		},
+		description:
+			"Returns the catalog of VIDEO models to choose from: id, name, what it's best at, durations (seconds), resolutions, aspect ratios, and an indicative price in credits (for the default duration; longer clips cost more). Call this BEFORE generate_video when the user wants to pick a specific video model or compare options/prices.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				project_dir: {
+					type: "string",
+					description:
+						"Absolute path of the project (default: current directory).",
+				},
+			},
+		},
+	},
+	{
+		name: "generate_video",
+		title: "Generate a video with a chosen model + settings",
+		annotations: {
+			readOnlyHint: false,
+			destructiveHint: false,
+			openWorldHint: true,
+		},
+		description:
+			"Standalone VIDEO generator — DESTINATION = an mp4 FILE on the user's disk. Pick a specific video model + settings (duration, resolution, aspect ratio) and DOWNLOAD the result as a native mp4 into a tidy folder, billed at the regular SITE price. Video takes several MINUTES and needs a PAID plan (no free video). Use it for ads, social clips, b-roll, promos to download — never to place into a website page. If the call says the video is still rendering, run it again with the SAME settings in ~1 min to pick it up (no double charge). Get valid model ids + options from list_video_models. DEFAULT when the user names NO model: grok-imagine-video, 6s, 720p. ORIENTATION: if the user didn't state one, ASK 'vertical or horizontal?' before generating, then pass the matching format (16:9 = horizontal, 9:16 = vertical).",
+		inputSchema: {
+			type: "object",
+			properties: {
+				model: {
+					type: "string",
+					description:
+						'Optional video model id from list_video_models, e.g. "kling-3.0". If omitted, defaults to grok-imagine-video (6s, 720p).',
+				},
+				subject: {
+					type: "string",
+					description: "What the video shows (the prompt).",
+				},
+				image: {
+					type: "string",
+					description:
+						'Optional START image for image-to-video (animate a picture): a local file path, "clipboard", or a public https URL. Only models that support image-to-video accept it.',
+				},
+				images: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						'Optional MULTIPLE reference images for models that blend several (e.g. Seedance up to 9, Veo up to 3). File paths, "clipboard", or https URLs. Capped to the model\'s max. Use this OR image.',
+				},
+				duration: {
+					type: "integer",
+					description:
+						"Optional clip length in seconds (must be one the model supports — see list_video_models). Defaults to the model's default. Longer = more credits.",
+				},
+				resolution: {
+					type: "string",
+					description:
+						'Optional resolution, e.g. "720p"/"1080p"/"4K" (see list_video_models).',
+				},
+				format: {
+					type: "string",
+					description:
+						'Optional aspect ratio, e.g. "16:9", "9:16", "1:1" (see list_video_models).',
+				},
+				out_dir: {
+					type: "string",
+					description:
+						"Folder to download the mp4 into (default 'distribea-videos'). Named after the subject, never overwrites an existing file.",
+				},
+				project_dir: {
+					type: "string",
+					description:
+						"Absolute path of the project root (default: current directory).",
+				},
+				dry_run: {
+					type: "boolean",
+					description:
+						"PREVIEW mode: shows the exact site price + settings and generates NOTHING (0 credit).",
+				},
+			},
+			required: ["subject"],
+		},
+	},
+	{
+		name: "list_music_models",
+		title: "List the music models the user can pick",
+		annotations: {
+			readOnlyHint: true,
+			destructiveHint: false,
+			openWorldHint: false,
+		},
+		description:
+			"Returns the catalog of MUSIC models (id, name, indicative price in credits). Call this BEFORE generate_music when the user wants to pick a specific music model or compare prices.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				project_dir: {
+					type: "string",
+					description:
+						"Absolute path of the project (default: current directory).",
+				},
+			},
+		},
+	},
+	{
+		name: "generate_music",
+		title: "Generate a music track with a chosen model",
+		annotations: {
+			readOnlyHint: false,
+			destructiveHint: false,
+			openWorldHint: true,
+		},
+		description:
+			"Standalone MUSIC generator — DESTINATION = an audio FILE on the user's disk (mp3), downloaded into a tidy folder, billed at the SITE price. Needs a PAID plan (no free audio). Use it for background tracks, jingles, b-roll music to download — never placed into a page. Describe the music (style, mood, instruments) in `subject`. If it says still rendering, run again with the SAME settings to pick it up (no double charge). Get model ids from list_music_models. DEFAULT when the user names NO model: minimax-music.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				model: {
+					type: "string",
+					description:
+						'Optional music model id from list_music_models, e.g. "cassetteai-music". If omitted, defaults to minimax-music.',
+				},
+				subject: {
+					type: "string",
+					description: "Describe the music (style, mood, tempo, instruments).",
+				},
+				duration: {
+					type: "integer",
+					description:
+						"Optional length in seconds (when the model supports it).",
+				},
+				out_dir: {
+					type: "string",
+					description:
+						"Folder to download the mp3 into (default 'distribea-music'). Never overwrites.",
+				},
+				project_dir: {
+					type: "string",
+					description:
+						"Absolute path of the project root (default: current directory).",
+				},
+				dry_run: {
+					type: "boolean",
+					description:
+						"PREVIEW: shows the exact site price and generates NOTHING (0 credit).",
+				},
+			},
+			required: ["subject"],
+		},
+	},
+	{
+		name: "list_voice_models",
+		title: "List the voice-over models (and sample voices)",
+		annotations: {
+			readOnlyHint: true,
+			destructiveHint: false,
+			openWorldHint: false,
+		},
+		description:
+			"Returns the catalog of VOICE-OVER models: id, name, supported languages, number of voices, a few sample voice ids, and an indicative price per 500 characters. Call this BEFORE generate_voice to pick a model + a voice id + a language.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				project_dir: {
+					type: "string",
+					description:
+						"Absolute path of the project (default: current directory).",
+				},
+			},
+		},
+	},
+	{
+		name: "generate_voice",
+		title: "Generate a voice-over (text to speech) with a chosen voice",
+		annotations: {
+			readOnlyHint: false,
+			destructiveHint: false,
+			openWorldHint: true,
+		},
+		description:
+			"Standalone VOICE-OVER generator — DESTINATION = an audio FILE on the user's disk (mp3), downloaded into a tidy folder, billed at the SITE price (per character). Needs a PAID plan (no free audio). Use it for narration, ads, IVR, video voice-overs to download — never placed into a page. Pass the script in `text`, plus a voice id and language from list_voice_models (a default voice is picked if you omit it). If it says still rendering, run again with the SAME settings to pick it up (no double charge). DEFAULT when the user names NO model: elevenlabs-multilingual-v2 with the Roger voice.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				model: {
+					type: "string",
+					description:
+						'Optional voice model id from list_voice_models, e.g. "minimax-speech-hd". If omitted, defaults to elevenlabs-multilingual-v2 (Roger voice).',
+				},
+				text: {
+					type: "string",
+					description: "The exact words the voice should read.",
+				},
+				voice: {
+					type: "string",
+					description:
+						"Optional voice id from list_voice_models. If omitted with ElevenLabs, defaults to the Roger voice; other models fall back to their first voice.",
+				},
+				language: {
+					type: "string",
+					description:
+						"Optional language code from list_voice_models (e.g. 'en-US', 'fr'). Required for some models (Kokoro).",
+				},
+				out_dir: {
+					type: "string",
+					description:
+						"Folder to download the mp3 into (default 'distribea-voice'). Never overwrites.",
+				},
+				project_dir: {
+					type: "string",
+					description:
+						"Absolute path of the project root (default: current directory).",
+				},
+				dry_run: {
+					type: "boolean",
+					description:
+						"PREVIEW: shows the exact site price and generates NOTHING (0 credit).",
+				},
+			},
+			required: ["text"],
 		},
 	},
 	{
@@ -4216,6 +5130,14 @@ const TOOL_RUNNERS = {
 	make_images: runMakeImages,
 	bring_alive: runBringAlive,
 	generate_image: runGenerateImage,
+	list_models: runListModels,
+	generate_with_model: runGenerateWithModel,
+	list_video_models: runListVideoModels,
+	generate_video: runGenerateVideo,
+	list_music_models: runListMusicModels,
+	generate_music: runGenerateMusic,
+	list_voice_models: runListVoiceModels,
+	generate_voice: runGenerateVoice,
 	blog_cover: runBlogCover,
 	edit_image: runEditImage,
 	site_style: runSiteStyle,
@@ -4303,6 +5225,732 @@ async function ensureAccess() {
 		result,
 	};
 	return result;
+}
+
+// ===========================================================================
+// MODE CLI (ligne de commande) — même moteur que le MCP, piloté à la main.
+//   distribea image|video|music|voice "<sujet>"  ·  page · models · login
+// Zéro dépendance : couleurs ANSI maison + questions interactives (readline).
+// ===========================================================================
+
+const CLI_ESC = String.fromCharCode(27); // \x1b — début d'une séquence ANSI
+const CLI_USE_COLOR = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
+function cliPaint(code, s) {
+	return CLI_USE_COLOR ? `${CLI_ESC}[${code}m${s}${CLI_ESC}[0m` : String(s);
+}
+const cc = {
+	bold: (s) => cliPaint("1", s),
+	dim: (s) => cliPaint("2", s),
+	red: (s) => cliPaint("31", s),
+	green: (s) => cliPaint("32", s),
+	yellow: (s) => cliPaint("33", s),
+	blue: (s) => cliPaint("34", s),
+	cyan: (s) => cliPaint("36", s),
+};
+
+let CLI_VERSION = "0.0.0";
+try {
+	CLI_VERSION =
+		createRequire(import.meta.url)("./package.json").version ?? CLI_VERSION;
+} catch {
+	// package.json illisible = version inconnue, sans gravité
+}
+
+const cliOut = (s) => process.stdout.write(s.endsWith("\n") ? s : `${s}\n`);
+const cliErr = (s) => process.stderr.write(s.endsWith("\n") ? s : `${s}\n`);
+
+// Sortie propre. On pose le code de sortie et on laisse la boucle d'événements
+// se vider d'elle-même (cas normal → sortie immédiate). Si une socket keep-alive
+// (fetch/undici) la maintient ouverte, un minuteur unref'd force la sortie après
+// un court instant — une fois la socket au repos, donc SANS la course de
+// fermeture de handle qui fait planter process.exit() en pleine fermeture sur
+// Windows (assertion libuv UV_HANDLE_CLOSING).
+function cliFinish(code) {
+	process.exitCode = typeof code === "number" ? code : 0;
+	const t = setTimeout(() => process.exit(process.exitCode), 200);
+	t.unref?.();
+}
+
+// Ouvre une URL dans le navigateur par défaut (comme `higgsfield auth login`).
+// Sans dépendance : commande native selon l'OS. Échec silencieux (réseau, pas
+// d'interface) → on retombe sur le simple copier-coller.
+function cliOpenBrowser(url) {
+	let file = "xdg-open";
+	let args = [url];
+	if (process.platform === "win32") {
+		file = "cmd";
+		args = ["/c", "start", "", url];
+	} else if (process.platform === "darwin") {
+		file = "open";
+		args = [url];
+	}
+	try {
+		spawnSync(file, args, { stdio: "ignore" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// Saisie interactive (une question → une réponse). Sort sur stderr pour garder
+// stdout propre si la sortie est redirigée.
+function cliAsk(question) {
+	return new Promise((resolveAns) => {
+		const rl = createInterface({
+			input: process.stdin,
+			output: process.stderr,
+		});
+		rl.question(`${question} `, (answer) => {
+			rl.close();
+			resolveAns(String(answer).trim());
+		});
+	});
+}
+
+// Menu numéroté → renvoie la valeur choisie (1er choix par défaut si saisie vide).
+async function cliChoose(question, choices) {
+	cliErr(cc.bold(question));
+	for (let i = 0; i < choices.length; i++) {
+		cliErr(`  ${cc.cyan(String(i + 1))}. ${choices[i].label}`);
+	}
+	const ans = await cliAsk(cc.dim("Ton choix (numéro) :"));
+	const idx = Number.parseInt(ans, 10) - 1;
+	return choices[idx] ? choices[idx].value : choices[0].value;
+}
+
+// Récupère une valeur requise : depuis l'argument, sinon on la demande (si
+// terminal interactif), sinon on lève une erreur claire (sortie redirigée).
+async function cliNeed(value, question) {
+	const v = String(value ?? "").trim();
+	if (v) {
+		return v;
+	}
+	if (!process.stdin.isTTY) {
+		throw new Error(`Information manquante : ${question}`);
+	}
+	const ans = await cliAsk(cc.bold(question));
+	if (!ans) {
+		throw new Error("Annulé (rien saisi).");
+	}
+	return ans;
+}
+
+// Spinner d'attente sur stderr (silencieux/ligne simple si pas de terminal).
+function cliSpinner(label) {
+	if (!process.stderr.isTTY) {
+		cliErr(cc.dim(`${label}…`));
+		return () => {};
+	}
+	const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+	let i = 0;
+	const timer = setInterval(() => {
+		const f = frames[i % frames.length];
+		i++;
+		process.stderr.write(`\r${cc.cyan(f)} ${label}   `);
+	}, 90);
+	timer.unref?.();
+	return () => {
+		clearInterval(timer);
+		process.stderr.write(`\r${" ".repeat(label.length + 8)}\r`);
+	};
+}
+
+// Découpe les arguments en positionnels + drapeaux :
+//   ["un chat", "--model", "flux", "--png"] → { positionals:["un chat"],
+//   flags:{ model:"flux", png:true } }
+function cliParseFlags(args) {
+	const positionals = [];
+	const flags = {};
+	for (let i = 0; i < args.length; i++) {
+		const a = args[i];
+		if (a.startsWith("--")) {
+			const key = a.slice(2);
+			const next = args[i + 1];
+			if (next === undefined || next.startsWith("--")) {
+				flags[key] = true;
+			} else {
+				flags[key] = next;
+				i++;
+			}
+		} else if (a.length > 1 && a.startsWith("-")) {
+			flags[a.slice(1)] = true;
+		} else {
+			positionals.push(a);
+		}
+	}
+	return { positionals, flags };
+}
+
+// Orientation depuis les drapeaux courants (vide = non précisée).
+function cliFormatFromFlags(flags) {
+	if (flags.format) {
+		return String(flags.format);
+	}
+	if (flags.portrait) {
+		return "9:16";
+	}
+	if (flags.landscape) {
+		return "16:9";
+	}
+	if (flags.square) {
+		return "1:1";
+	}
+	return "";
+}
+
+const cliTruthy = (v) => v === true || v === "true" || v === "1";
+
+// Lance un outil du moteur exactement comme le MCP (gate abonnement + débit),
+// avec spinner, puis renvoie { text, images } normalisé.
+async function cliRunTool(name, args, label) {
+	const gate = await ensureAccess();
+	if (!gate.ok) {
+		throw new Error(gate.message);
+	}
+	CALL_CREDITS = 0;
+	LAST_GIFT = null;
+	const stop = cliSpinner(label);
+	let lastMsg = "";
+	const progress = (message) => {
+		if (message && message !== lastMsg) {
+			lastMsg = message;
+			if (!process.stderr.isTTY) {
+				cliErr(`  ${cc.dim(message)}`);
+			}
+		}
+	};
+	try {
+		const out = await TOOL_RUNNERS[name](args, progress);
+		stop();
+		return typeof out === "string"
+			? { text: out, images: [] }
+			: { images: [], ...out };
+	} catch (e) {
+		stop();
+		throw e;
+	}
+}
+
+// Affiche le texte de l'outil + le coût réel + le compteur de cadeaux.
+function cliPrintResult(result) {
+	if (result.text) {
+		cliOut(String(result.text).trim());
+	}
+	if (CALL_CREDITS > 0 && LAST_BALANCE !== null) {
+		cliOut(
+			`${cc.yellow(`💳 ${CALL_CREDITS} crédits`)} ${cc.dim(`— solde ${LAST_BALANCE}`)}`
+		);
+	}
+	if (LAST_GIFT) {
+		const g = LAST_GIFT;
+		if (g.remaining > 0) {
+			cliOut(
+				cc.green(
+					`🎁 ${g.remaining}/${g.limit} image(s) offerte(s) restante(s).`
+				)
+			);
+		} else {
+			cliOut(
+				cc.yellow(
+					`🎁 Images offertes épuisées (${g.limit}/${g.limit}). Débloque tes crédits : ${APP_URL}/account/billing`
+				)
+			);
+		}
+	}
+}
+
+// --- commandes conviviales -------------------------------------------------
+
+async function cliCmdImage(positionals, flags) {
+	const subject = await cliNeed(
+		positionals.join(" "),
+		"Que doit montrer l'image ?"
+	);
+	let format = cliFormatFromFlags(flags);
+	if (!format && process.stdin.isTTY) {
+		format = await cliChoose("Orientation ?", [
+			{ label: "Paysage (16:9)", value: "16:9" },
+			{ label: "Portrait (9:16)", value: "9:16" },
+			{ label: "Carré (1:1)", value: "1:1" },
+		]);
+	}
+	const dry = cliTruthy(flags["dry-run"]) || cliTruthy(flags.preview);
+	const args = {
+		subject,
+		file_type: flags.jpg ? "jpg" : "png",
+		...(flags.model ? { model: flags.model } : {}),
+		...(format ? { format } : {}),
+		...(flags.quality ? { quality: flags.quality } : {}),
+		...(flags.ref ? { image: flags.ref } : {}),
+		...(flags.count ? { count: Number(flags.count) } : {}),
+		...(flags.out ? { out_dir: flags.out } : {}),
+		...(dry ? { dry_run: true } : {}),
+	};
+	const result = await cliRunTool(
+		"generate_with_model",
+		args,
+		dry ? "Estimation" : "Génération de l'image"
+	);
+	cliPrintResult(result);
+	return 0;
+}
+
+async function cliCmdVideo(positionals, flags) {
+	const subject = await cliNeed(
+		positionals.join(" "),
+		"Que doit montrer la vidéo ?"
+	);
+	let format = cliFormatFromFlags(flags);
+	if (!format && process.stdin.isTTY) {
+		format = await cliChoose("Orientation ?", [
+			{ label: "Horizontale (16:9)", value: "16:9" },
+			{ label: "Verticale (9:16)", value: "9:16" },
+		]);
+	}
+	const dry = cliTruthy(flags["dry-run"]) || cliTruthy(flags.preview);
+	const args = {
+		subject,
+		...(flags.model ? { model: flags.model } : {}),
+		...(format ? { format } : {}),
+		...(flags.duration ? { duration: Number(flags.duration) } : {}),
+		...(flags.resolution ? { resolution: flags.resolution } : {}),
+		...(flags.ref ? { image: flags.ref } : {}),
+		...(flags.out ? { out_dir: flags.out } : {}),
+		...(dry ? { dry_run: true } : {}),
+	};
+	const result = await cliRunTool(
+		"generate_video",
+		args,
+		dry ? "Estimation" : "Génération de la vidéo (quelques minutes)"
+	);
+	cliPrintResult(result);
+	return 0;
+}
+
+async function cliCmdMusic(positionals, flags) {
+	const subject = await cliNeed(
+		positionals.join(" "),
+		"Décris la musique (style, ambiance, instruments) :"
+	);
+	const dry = cliTruthy(flags["dry-run"]) || cliTruthy(flags.preview);
+	const args = {
+		subject,
+		...(flags.model ? { model: flags.model } : {}),
+		...(flags.duration ? { duration: Number(flags.duration) } : {}),
+		...(flags.out ? { out_dir: flags.out } : {}),
+		...(dry ? { dry_run: true } : {}),
+	};
+	const result = await cliRunTool(
+		"generate_music",
+		args,
+		dry ? "Estimation" : "Génération de la musique"
+	);
+	cliPrintResult(result);
+	return 0;
+}
+
+async function cliCmdVoice(positionals, flags) {
+	const text = await cliNeed(
+		positionals.join(" "),
+		"Quel texte doit être lu ?"
+	);
+	const dry = cliTruthy(flags["dry-run"]) || cliTruthy(flags.preview);
+	const args = {
+		text,
+		...(flags.model ? { model: flags.model } : {}),
+		...(flags.voice ? { voice: flags.voice } : {}),
+		...(flags.lang || flags.language
+			? { language: flags.lang ?? flags.language }
+			: {}),
+		...(flags.out ? { out_dir: flags.out } : {}),
+		...(dry ? { dry_run: true } : {}),
+	};
+	const result = await cliRunTool(
+		"generate_voice",
+		args,
+		dry ? "Estimation" : "Génération de la voix"
+	);
+	cliPrintResult(result);
+	return 0;
+}
+
+async function cliCmdPage(positionals, flags) {
+	const dry = cliTruthy(flags["dry-run"]) || cliTruthy(flags.preview);
+	const args = {
+		...(positionals[0] ? { page_path: positionals[0] } : {}),
+		...(cliTruthy(flags.rebrand) ? { rebrand: true } : {}),
+		...(cliTruthy(flags.apply) ? { apply: true } : {}),
+		...(flags.max ? { max_images: Number(flags.max) } : {}),
+		...(dry ? { dry_run: true } : {}),
+	};
+	const result = await cliRunTool(
+		"make_images",
+		args,
+		dry ? "Repérage des images" : "Habillage de la page"
+	);
+	cliPrintResult(result);
+	return 0;
+}
+
+async function cliCmdBlog(positionals, flags) {
+	const args = {};
+	if (flags.url) {
+		args.article_url = flags.url;
+	} else if (flags.file) {
+		args.article_file = flags.file;
+	} else {
+		args.article_text = await cliNeed(
+			positionals.join(" "),
+			"Colle le titre + le texte de l'article :"
+		);
+	}
+	if (flags.illustrations) {
+		args.illustrations = Number(flags.illustrations);
+	}
+	if (cliTruthy(flags["dry-run"])) {
+		args.dry_run = true;
+	}
+	const result = await cliRunTool("blog_cover", args, "Couverture d'article");
+	cliPrintResult(result);
+	return 0;
+}
+
+async function cliCmdModels(positionals) {
+	const kind = String(positionals[0] ?? "image").toLowerCase();
+	const tool = {
+		image: "list_models",
+		video: "list_video_models",
+		music: "list_music_models",
+		voice: "list_voice_models",
+	}[kind];
+	if (!tool) {
+		throw new Error(
+			`Type inconnu : ${kind}. Choisis image | video | music | voice.`
+		);
+	}
+	const result = await cliRunTool(tool, {}, "Chargement des modèles");
+	cliPrintResult(result);
+	return 0;
+}
+
+// Échappatoire générique : appelle N'IMPORTE quel outil du moteur.
+//   distribea call create_reference --kind product --photo_path ./p.jpg
+async function cliCmdCall(positionals, flags) {
+	const tool = positionals[0];
+	if (!(tool && TOOL_RUNNERS[tool])) {
+		throw new Error(
+			`Outil inconnu : ${tool ?? "(vide)"}. Liste complète : « distribea help ».`
+		);
+	}
+	const args = {};
+	for (const [k, v] of Object.entries(flags)) {
+		if (v === "true") {
+			args[k] = true;
+		} else if (v === "false") {
+			args[k] = false;
+		} else {
+			args[k] = v;
+		}
+	}
+	const result = await cliRunTool(tool, args, tool);
+	cliPrintResult(result);
+	return 0;
+}
+
+// --- clé mémorisée (login / logout / whoami) -------------------------------
+
+function cliWriteConfig(patch) {
+	mkdirSync(CLI_CONFIG_DIR, { recursive: true });
+	const merged = { ...readCliConfig(), ...patch };
+	writeFileSync(CLI_CONFIG_PATH, JSON.stringify(merged, null, 2));
+	return merged;
+}
+
+function cliLoginReason(reason) {
+	if (reason === "free_trial") {
+		return "le MCP n'est pas inclus dans l'essai gratuit.";
+	}
+	if (reason === "no_subscription") {
+		return "aucun abonnement actif sur ce compte.";
+	}
+	return "clé invalide ou expirée.";
+}
+
+// Connexion automatique façon `gh auth login` : on ouvre le navigateur, tu cliques
+// « Autoriser », et la clé revient seule dans le terminal. Renvoie
+// { supported:false } si le serveur ne gère pas encore ce flux (ancien
+// déploiement) → repli sur le copier-coller. Lève si refusé/expiré.
+async function cliDeviceLogin(appUrl) {
+	let start;
+	try {
+		const res = await fetch(`${appUrl}/api/mcp/device/start`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				client_name: "distribea-cli",
+				client_version: CLI_VERSION,
+			}),
+			signal: AbortSignal.timeout(8000),
+		});
+		if (!res.ok) {
+			return { supported: false };
+		}
+		start = await res.json().catch(() => null);
+	} catch {
+		return { supported: false };
+	}
+	if (!(start?.device_code && start?.user_code)) {
+		return { supported: false };
+	}
+
+	const verifyUrl = `${appUrl}/account/mcp?cli=${encodeURIComponent(start.user_code)}`;
+	cliErr(`${cc.bold("Connexion Distribea")} — autorise dans ton navigateur :`);
+	cliErr(`  ${cc.cyan(verifyUrl)}`);
+	cliErr(`  ${cc.dim(`Code : ${start.user_code}`)}`);
+	if (process.stdin.isTTY) {
+		cliOpenBrowser(verifyUrl);
+	}
+
+	const intervalMs = Math.max(2, Number(start.interval) || 5) * 1000;
+	const deadline = Date.now() + (Number(start.expires_in) || 600) * 1000;
+	const stop = cliSpinner("En attente de ton autorisation");
+	try {
+		while (Date.now() < deadline) {
+			await delay(intervalMs);
+			let poll;
+			try {
+				const res = await fetch(`${appUrl}/api/mcp/device/poll`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ device_code: start.device_code }),
+					signal: AbortSignal.timeout(8000),
+				});
+				poll = await res.json().catch(() => ({}));
+			} catch {
+				continue; // hoquet réseau → on réessaie au prochain tour
+			}
+			if (poll.status === "ok" && poll.token) {
+				return { supported: true, token: poll.token };
+			}
+			if (poll.status === "denied") {
+				throw new Error("Autorisation refusée dans le navigateur.");
+			}
+			if (poll.status === "expired") {
+				throw new Error("Demande expirée — relance « distribea login ».");
+			}
+		}
+		throw new Error("Délai dépassé — relance « distribea login ».");
+	} finally {
+		stop();
+	}
+}
+
+// Vérifie une clé fournie/collée puis l'enregistre.
+async function cliVerifyAndSave(key, appUrl) {
+	const stop = cliSpinner("Vérification de la clé");
+	let data;
+	try {
+		const res = await fetch(`${appUrl}/api/mcp/verify`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				token: key,
+				client_name: "distribea-cli",
+				client_version: CLI_VERSION,
+			}),
+			signal: AbortSignal.timeout(8000),
+		});
+		data = await res.json().catch(() => ({}));
+	} catch (e) {
+		stop();
+		throw new Error(`Impossible de joindre ${appUrl} : ${e.message}`);
+	}
+	stop();
+	if (!data.ok) {
+		throw new Error(
+			`Clé refusée : ${cliLoginReason(data.reason)} Gère ton abonnement sur ${appUrl}/account/billing`
+		);
+	}
+	cliWriteConfig({ key, app_url: appUrl });
+	cliOut(
+		`${cc.green("✓ Connecté.")} Lance par exemple : ${cc.cyan('distribea image "un chat sur une falaise"')}`
+	);
+	return 0;
+}
+
+async function cliCmdLogin(rest) {
+	const { positionals, flags } = cliParseFlags(rest);
+	const appUrl = flags.app ? String(flags.app).replace(/\/+$/, "") : APP_URL;
+	const explicitKey = positionals[0];
+
+	// Clé donnée à la main (CI / scripts) → on vérifie et on garde.
+	if (explicitKey) {
+		return await cliVerifyAndSave(explicitKey, appUrl);
+	}
+
+	// Sinon : connexion automatique par le navigateur (zéro copier-coller).
+	const dev = await cliDeviceLogin(appUrl);
+	if (dev.supported) {
+		cliWriteConfig({ key: dev.token, app_url: appUrl });
+		cliOut(
+			`${cc.green("✓ Connecté.")} Lance par exemple : ${cc.cyan('distribea image "un chat sur une falaise"')}`
+		);
+		return 0;
+	}
+
+	// Repli (serveur sans connexion auto) : on ouvre la page et on colle la clé.
+	const keyUrl = `${appUrl}/account/mcp`;
+	if (process.stdin.isTTY) {
+		cliErr(cc.dim(`J'ouvre ${keyUrl} — copie ta clé puis colle-la ici.`));
+		cliOpenBrowser(keyUrl);
+	}
+	const pasted = await cliAsk(cc.bold("Colle ta clé MCP (dmcp_…) :"));
+	if (!pasted) {
+		throw new Error("Aucune clé saisie.");
+	}
+	return await cliVerifyAndSave(pasted, appUrl);
+}
+
+function cliCmdLogout() {
+	if (existsSync(CLI_CONFIG_PATH)) {
+		try {
+			unlinkSync(CLI_CONFIG_PATH);
+		} catch {
+			// rien à oublier
+		}
+	}
+	cliOut(`${cc.green("✓ Déconnecté.")} Clé oubliée.`);
+	return 0;
+}
+
+async function cliCmdWhoami() {
+	if (!TOKEN) {
+		cliOut(`Pas de clé enregistrée. Lance ${cc.cyan("distribea login")}.`);
+		return 1;
+	}
+	const gate = await ensureAccess();
+	if (gate.ok) {
+		cliOut(
+			`${cc.green("✓ Connecté")} — moteur ${APP_URL}, clé ${TOKEN.slice(0, 12)}…`
+		);
+		return 0;
+	}
+	cliErr(`${cc.red("✖")} ${gate.message}`);
+	return 1;
+}
+
+// --- aide -------------------------------------------------------------------
+
+function cliPrintHelp() {
+	cliOut(`
+${cc.bold("Distribea")} ${cc.dim(`v${CLI_VERSION}`)} — images, vidéos, musiques et voix on-brand, au prix du site.
+
+${cc.bold("INSTALLATION")}
+  npm install -g distribea-mcp        ${cc.dim("# puis : distribea login")}
+
+${cc.bold("USAGE")}
+  distribea <commande> "<description>" [options]
+
+${cc.bold("COMMANDES")}
+  ${cc.cyan("login")}  [clé]          Connexion (ouvre le navigateur sur ta clé)
+  ${cc.cyan("image")}  "<sujet>"      Une image téléchargeable (png/jpg)
+  ${cc.cyan("video")}  "<sujet>"      Une vidéo mp4
+  ${cc.cyan("music")}  "<style>"      Une musique mp3
+  ${cc.cyan("voice")}  "<texte>"      Une voix-off mp3
+  ${cc.cyan("page")}   [chemin]       Habille une page / un site (placeholders → images)
+  ${cc.cyan("blog")}   "<article>"    Couverture d'article (16:9 + texte alt)
+  ${cc.cyan("models")} [type]         Liste les modèles : image | video | music | voice
+  ${cc.cyan("whoami")} · ${cc.cyan("logout")}      Vérifie / oublie la clé
+  ${cc.cyan("call")}   <outil> --k v  Appel direct d'un outil avancé
+
+${cc.bold("OPTIONS COURANTES")}
+  --model <id>      Modèle précis (voir « distribea models »)
+  --ref <fichier>   Image de référence (image-vers-image / vidéo)
+  --format <r>      16:9 (paysage), 9:16 (portrait), 1:1 (carré)
+  --portrait · --landscape · --square   Raccourcis d'orientation
+  --out <dossier>   Où télécharger le fichier
+  --jpg             Image en jpg au lieu de png
+  --dry-run         Devis seulement (0 crédit), ne génère rien
+
+${cc.bold("EXEMPLES")}
+  distribea login dmcp_xxxxx
+  distribea image "un chat roux sur une falaise au coucher du soleil"
+  distribea video "vagues lentes sur une plage tropicale" --portrait
+  distribea voice "Bienvenue chez nous" --lang fr
+  distribea page ./index.html
+  distribea image "logo minimaliste bleu" --dry-run
+
+Clé & docs : ${APP_URL}/account/mcp
+`);
+	return 0;
+}
+
+// --- aiguilleur CLI ---------------------------------------------------------
+
+async function runCli(argv) {
+	const [cmd, ...rest] = argv;
+	const first = cmd ?? "";
+
+	if (first === "--version" || first === "-v" || first === "version") {
+		cliOut(CLI_VERSION);
+		return 0;
+	}
+	if (!first || first === "help" || first === "--help" || first === "-h") {
+		return cliPrintHelp();
+	}
+	if (first === "login") {
+		return await cliCmdLogin(rest);
+	}
+	if (first === "logout") {
+		return cliCmdLogout();
+	}
+	if (first === "whoami") {
+		return await cliCmdWhoami();
+	}
+
+	// À partir d'ici une clé est nécessaire.
+	if (!TOKEN) {
+		cliErr(
+			`${cc.yellow("Aucune clé Distribea.")} Lance d'abord : ${cc.cyan("distribea login")}`
+		);
+		return 1;
+	}
+	MCP_CLIENT = { name: "distribea-cli", version: CLI_VERSION };
+
+	const { positionals, flags } = cliParseFlags(rest);
+	if (cliTruthy(flags.help) || cliTruthy(flags.h)) {
+		return cliPrintHelp();
+	}
+
+	switch (first) {
+		case "image":
+		case "img":
+			return await cliCmdImage(positionals, flags);
+		case "video":
+		case "vid":
+			return await cliCmdVideo(positionals, flags);
+		case "music":
+		case "song":
+			return await cliCmdMusic(positionals, flags);
+		case "voice":
+		case "tts":
+			return await cliCmdVoice(positionals, flags);
+		case "page":
+		case "site":
+			return await cliCmdPage(positionals, flags);
+		case "blog":
+			return await cliCmdBlog(positionals, flags);
+		case "models":
+		case "list":
+			return await cliCmdModels(positionals, flags);
+		case "call":
+			return await cliCmdCall(positionals, flags);
+		default:
+			cliErr(
+				`${cc.red(`Commande inconnue : ${first}`)}\n${cc.dim("Voir « distribea help ».")}`
+			);
+			return 1;
+	}
 }
 
 // --- transport MCP stdio -----------------------------------------------------------
@@ -4528,20 +6176,32 @@ async function handle(msg) {
 	}
 }
 
-const rl = createInterface({ input: process.stdin });
-rl.on("line", (line) => {
-	const trimmed = line.trim();
-	if (!trimmed) {
-		return;
-	}
-	let msg;
-	try {
-		msg = JSON.parse(trimmed);
-	} catch {
-		logErr(`bad JSON line: ${trimmed.slice(0, 120)}`);
-		return;
-	}
-	handle(msg).catch((e) => logErr(`handler error: ${e.message}`));
-});
-rl.on("close", () => process.exit(0));
-logErr(`Distribea MCP ready (clé ${TOKEN.slice(0, 16)}…, moteur ${APP_URL})`);
+if (IS_CLI) {
+	// Ligne de commande : on exécute la commande puis on sort avec son code.
+	runCli(CLI_ARGS)
+		.then((code) => cliFinish(code))
+		.catch((e) => {
+			cliErr(cliPaint("31", `✖ ${e?.message ?? e}`));
+			cliFinish(1);
+		});
+} else {
+	// Serveur MCP : transport stdio JSON-RPC, ligne à ligne (comportement
+	// d'origine, inchangé).
+	const rl = createInterface({ input: process.stdin });
+	rl.on("line", (line) => {
+		const trimmed = line.trim();
+		if (!trimmed) {
+			return;
+		}
+		let msg;
+		try {
+			msg = JSON.parse(trimmed);
+		} catch {
+			logErr(`bad JSON line: ${trimmed.slice(0, 120)}`);
+			return;
+		}
+		handle(msg).catch((e) => logErr(`handler error: ${e.message}`));
+	});
+	rl.on("close", () => process.exit(0));
+	logErr(`Distribea MCP ready (clé ${TOKEN.slice(0, 16)}…, moteur ${APP_URL})`);
+}

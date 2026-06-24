@@ -1,22 +1,31 @@
 {
   "name": "distribea-mcp",
-  "version": "1.13.7",
+  "version": "2.0.0",
   "mcpName": "io.github.Distribea/distribea-mcp",
-  "description": "Brand-aware image generation MCP, powered by Nano Banana Pro — define your brand once, every image ships on-brand and production-ready (WebP, SEO alt text, placed in your repo). Works with Claude Code, Cursor, Windsurf, Replit, Copilot.",
+  "description": "On-brand AI media toolkit — CLI + MCP server for generating images, video, music and voice. Define your brand once, then fill a whole page in one call (WebP, SEO alt text, patched into your repo) or download standalone assets at the site price. Works with Claude Code, Cursor, Windsurf, Replit, Copilot.",
   "type": "module",
   "bin": {
-    "distribea-mcp": "index.mjs"
+    "distribea-mcp": "index.mjs",
+    "distribea": "index.mjs"
   },
   "files": [
     "index.mjs",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "SKILL.md"
   ],
   "engines": {
     "node": ">=18.17"
   },
   "keywords": [
+    "ai-toolkit",
+    "ai-media",
+    "cli",
     "image-generation",
+    "video-generation",
+    "music-generation",
+    "text-to-speech",
+    "image-to-video",
     "mcp",
     "mcp-server",
     "image-mcp",
