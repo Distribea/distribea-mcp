@@ -14,7 +14,7 @@
 
 </div>
 
-**Distribea is an on-brand AI media toolkit for builders.** It generates **images, video, music and voice** from plain-language prompts and ships them production-ready — optimised **WebP** with **SEO alt text**, downloaded for you or patched straight into your code. One connector, four media types, reachable three ways: a **CLI** in your terminal, an **MCP server** your AI coding agent calls while it builds, and a **Claude Skill**. Define your brand once; a built-in **AI art director** writes every prompt — you say **what** you want, never **how** to render it. Billed in credits at the regular **site price**; the connector holds **no API keys and no secrets**.
+**[Distribea](https://distribea.com) remakes any video with you in it ([Motion Control](https://distribea.com/ai/motion-control)) and gives a royalty-free library of music, sound effects, footage and images.** This package is its on-brand AI media toolkit for builders: it generates **images, video, music and voice** from plain-language prompts and ships them production-ready — optimised **WebP** with **SEO alt text**, downloaded for you or patched straight into your code. One connector, four media types, reachable three ways: a **CLI** in your terminal, an **MCP server** your AI coding agent calls while it builds, and a **Claude Skill**. Define your brand once; a built-in **AI art director** writes every prompt — you say **what** you want, never **how** to render it. Billed in credits at the regular **site price**; the connector holds **no API keys and no secrets**.
 
 ```bash
 npm install -g distribea-mcp
