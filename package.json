@@ -1,8 +1,8 @@
 {
   "name": "distribea-mcp",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "mcpName": "io.github.Distribea/distribea-mcp",
-  "description": "On-brand AI media toolkit — CLI + MCP server for generating images, video, music and voice. Define your brand once, then fill a whole page in one call (WebP, SEO alt text, patched into your repo) or download standalone assets at the site price. Works with Claude Code, Cursor, Windsurf, Replit, Copilot.",
+  "description": "Distribea remakes any video with you in it (Motion Control) and gives a royalty-free media library. This is its CLI + MCP server: images, video, music and voice from your terminal or AI agent, on-brand and production-ready (WebP, SEO alt text). Works with Claude Code, Cursor, Windsurf, Replit, Copilot.",
   "type": "module",
   "bin": {
     "distribea-mcp": "index.mjs",
